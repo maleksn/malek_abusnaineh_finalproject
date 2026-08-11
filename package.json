@@ -1,0 +1,28 @@
+{
+  "name": "malek_abu_snaineh_finalproject",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "build": "tsc",
+    "start": "node dist/server.js"
+  },
+  "keywords": [],
+  "author": "Malek Abu Snaineh",
+  "license": "MIT",
+  "description": "log ingestion and query service built with TypeScript, Express, Drizzle ORM, and PostgreSQL.",
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "@types/node": "^26.1.2",
+    "drizzle-kit": "^0.31.10",
+    "tsx": "^4.23.1",
+    "typescript": "^7.0.2"
+  },
+  "dependencies": {
+    "dotenv": "^17.4.2",
+    "drizzle-orm": "^0.45.2",
+    "express": "^5.2.1",
+    "postgres": "^3.4.9",
+    "zod": "^4.4.3"
+  }
+}
