@@ -15,6 +15,7 @@ type RejectedLog = {
   reason: string;
 };
 
+
 const logsRouter = Router();
 
 logsRouter.post("/", async (req, res) => {

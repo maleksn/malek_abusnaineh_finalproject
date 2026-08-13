@@ -6,7 +6,7 @@ import { errorHandler } from "./middleware/errorHandler";
 const app = express();
 
 // Middleware
-app.use(express.json());
+app.use(express.json({ limit: "1mb" }));
 
 app.use("/logs", logsRouter);
 

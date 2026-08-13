@@ -9,20 +9,56 @@ import type { LogCursor } from "../utils/cursor";
 
 import { and, desc, eq, gte, lt, sql } from "drizzle-orm";
 
+type PreparedInsert = {
+  execute: (params: Record<string, unknown>) => Promise<unknown>;
+};
+
+const preparedInsertCache = new Map<number, PreparedInsert>();
+
+function getPreparedInsert(batchSize: number): PreparedInsert {
+  const cached = preparedInsertCache.get(batchSize);
+
+  if (cached !== undefined) {
+    return cached;
+  }
+
+  const rows = Array.from({ length: batchSize }, (_, index) => ({
+    timestamp: sql.placeholder(`timestamp_${index}`),
+    level: sql.placeholder(`level_${index}`),
+    service: sql.placeholder(`service_${index}`),
+    message: sql.placeholder(`message_${index}`),
+    attributes: sql.placeholder(`attributes_${index}`),
+  }));
+
+  const prepared = db
+    .insert(logsTable)
+    .values(rows)
+    .prepare(`insert_logs_${batchSize}`);
+
+  preparedInsertCache.set(batchSize, prepared);
+
+  return prepared;
+}
+
 export async function insertLogs(logs: ValidLog[]): Promise<void> {
   // Just for more security
   if (logs.length === 0) {
     return;
   }
 
-  const rows = logs.map((log) => ({
-    timestamp: new Date(log.timestamp),
-    level: log.level,
-    service: log.service,
-    message: log.message,
-    attributes: log.attributes,
-  }));
-  await db.insert(logsTable).values(rows);
+  const prepared = getPreparedInsert(logs.length);
+
+  const params: Record<string, unknown> = {};
+
+  for (const [index, log] of logs.entries()) {
+    params[`timestamp_${index}`] = new Date(log.timestamp);
+    params[`level_${index}`] = log.level;
+    params[`service_${index}`] = log.service;
+    params[`message_${index}`] = log.message;
+    params[`attributes_${index}`] = log.attributes;
+  }
+
+  await prepared.execute(params);
 }
 
 export async function queryLogs(

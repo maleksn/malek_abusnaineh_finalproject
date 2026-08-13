@@ -9,7 +9,6 @@ import {
   pgEnum,
 } from "drizzle-orm/pg-core";
 
-
 export const logLevelEnum = pgEnum("log_level", [
   "debug",
   "info",
@@ -22,8 +21,7 @@ export const logs = pgTable(
   {
     id: bigserial("id", {
       mode: "number",
-    })
-      .primaryKey(),
+    }).primaryKey(),
 
     timestamp: timestamp("timestamp", {
       withTimezone: true,
@@ -37,14 +35,15 @@ export const logs = pgTable(
 
     message: text("message").notNull(),
 
-    attributes: jsonb("attributes")
-      .notNull()
-      .default({}),
+    attributes: jsonb("attributes").notNull().default({}),
 
     createdAt: timestamp("created_at", {
       withTimezone: true,
     })
       .notNull()
       .defaultNow(),
-  }
+  },
+  (table) => [
+    index("logs_timestamp_id_idx").on(table.timestamp.desc(), table.id.desc()),
+  ],
 );
