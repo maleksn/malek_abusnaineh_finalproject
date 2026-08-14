@@ -9,6 +9,7 @@ import type { LogCursor } from "../utils/cursor";
 
 import { and, desc, eq, gte, lt, sql } from "drizzle-orm";
 
+// تعريف النوع بشكل صحيح لـ pg driver
 type PreparedInsert = {
   execute: (params: Record<string, unknown>) => Promise<unknown>;
 };
@@ -22,6 +23,7 @@ function getPreparedInsert(batchSize: number): PreparedInsert {
     return cached;
   }
 
+  // إنشاء placeholders ديناميكياً لكن داخل Drizzle (آمن 100%)
   const rows = Array.from({ length: batchSize }, (_, index) => ({
     timestamp: sql.placeholder(`timestamp_${index}`),
     level: sql.placeholder(`level_${index}`),
@@ -30,6 +32,7 @@ function getPreparedInsert(batchSize: number): PreparedInsert {
     attributes: sql.placeholder(`attributes_${index}`),
   }));
 
+  // prepare() هنا هو السر: يخبر pg بعمل cache للـ query plan
   const prepared = db
     .insert(logsTable)
     .values(rows)
@@ -41,21 +44,21 @@ function getPreparedInsert(batchSize: number): PreparedInsert {
 }
 
 export async function insertLogs(logs: ValidLog[]): Promise<void> {
-  // Just for more security
-  if (logs.length === 0) {
-    return;
-  }
+  if (logs.length === 0) return;
 
   const prepared = getPreparedInsert(logs.length);
-
   const params: Record<string, unknown> = {};
 
-  for (const [index, log] of logs.entries()) {
-    params[`timestamp_${index}`] = new Date(log.timestamp);
-    params[`level_${index}`] = log.level;
-    params[`service_${index}`] = log.service;
-    params[`message_${index}`] = log.message;
-    params[`attributes_${index}`] = log.attributes;
+
+  for (let i = 0; i < logs.length; i++) {
+    const log = logs[i];
+    if (log === undefined) continue;
+
+    params[`timestamp_${i}`] = new Date(log.timestamp);
+    params[`level_${i}`] = log.level;
+    params[`service_${i}`] = log.service;
+    params[`message_${i}`] = log.message;
+    params[`attributes_${i}`] = log.attributes;
   }
 
   await prepared.execute(params);
