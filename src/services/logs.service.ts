@@ -16,7 +16,7 @@ import { and, desc, eq, gte, lt, sql } from "drizzle-orm";
 // ==========================================
 const FLUSH_MAX_LOGS = 5000; // حجم الدفعة الكبيرة
 const FLUSH_WAIT_MS = 20; // أقصى تأخير قبل الفلاش
-const MAX_PENDING_LOGS = 10000; // حد أمان للذاكرة
+const MAX_PENDING_LOGS = 50000; // حد أمان للذاكرة
 const COPY_CHUNK_SIZE = 65536; // 64 KB
 
 type PendingInsert = {

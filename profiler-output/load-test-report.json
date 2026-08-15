@@ -1,124 +1,37 @@
 {
-  "timestamp": "2026-08-15T03:24:44.841Z",
+  "timestamp": "2026-08-15T04:02:09.105Z",
   "options": {
     "url": "http://localhost:8080/logs",
     "rate": 15000,
-    "batchSize": 33,
-    "duration": 120,
-    "profile": true,
+    "batchSize": 500,
+    "duration": 10,
+    "profile": false,
     "outputDir": "./profiler-output"
   },
-  "totalLogs": 1800000,
-  "acceptedLogs": 1800000,
+  "totalLogs": 150000,
+  "acceptedLogs": 150000,
   "rejectedLogs": 0,
-  "totalElapsedSec": 121.78083356,
+  "totalElapsedSec": 10.244328083,
   "latency": {
-    "min": 23.509197999999742,
-    "avg": 93.11540507393752,
-    "p50": 80.69553399999859,
-    "p90": 149.84276600000157,
-    "p95": 186.76889199999277,
-    "p99": 296.66885699999693,
-    "p999": 465.9784170000057,
-    "max": 585.600983999997
+    "min": 36.039083000000005,
+    "avg": 102.7157804233334,
+    "p50": 85.49894700000004,
+    "p90": 179.56803799999943,
+    "p95": 249.09802000000036,
+    "p99": 363.7420000000002,
+    "p999": 397.40705100000014,
+    "max": 397.40705100000014
   },
   "statusCounts": {
-    "200 OK": 54546
+    "200 OK": 300
   },
-  "containerSummaries": {
-    "log-service-app": {
-      "name": "log-service-app",
-      "sampleCount": 244,
-      "peakCpuPerc": 45.22,
-      "avgCpuPerc": 26.354098360655733,
-      "peakMemMb": 53.7,
-      "avgMemMb": 52.23581967213119,
-      "memLimitMb": 256,
-      "peakMemPerc": 20.98,
-      "cpuLimitCores": 0.5,
-      "peakCpuOfLimit": 90.44,
-      "avgCpuOfLimit": 52.70819672131146,
-      "oomKilled": false,
-      "restarts": 0,
-      "status": "running"
-    },
-    "log-service-postgres": {
-      "name": "log-service-postgres",
-      "sampleCount": 244,
-      "peakCpuPerc": 12.46,
-      "avgCpuPerc": 8.98959016393443,
-      "peakMemMb": 176.2,
-      "avgMemMb": 169.81065573770493,
-      "memLimitMb": 1024,
-      "peakMemPerc": 17.21,
-      "cpuLimitCores": 1,
-      "peakCpuOfLimit": 12.46,
-      "avgCpuOfLimit": 8.98959016393443,
-      "oomKilled": false,
-      "restarts": 0,
-      "status": "running"
-    }
-  },
-  "functionMetrics": [
-    {
-      "category": "Zod safeParse & Schema Validation",
-      "hits": 6975,
-      "cpuPercent": 46.5,
-      "selfTimeMs": 3720
-    },
-    {
-      "category": "JSON.parse (express.json body parser)",
-      "hits": 3570,
-      "cpuPercent": 23.8,
-      "selfTimeMs": 1904
-    },
-    {
-      "category": "CSV Formatting (csvField)",
-      "hits": 1680,
-      "cpuPercent": 11.2,
-      "selfTimeMs": 896
-    },
-    {
-      "category": "JSON.stringify (attributes serialization)",
-      "hits": 1095,
-      "cpuPercent": 7.3,
-      "selfTimeMs": 584
-    },
-    {
-      "category": "Database Stream (pg-copy-streams)",
-      "hits": 615,
-      "cpuPercent": 4.1,
-      "selfTimeMs": 328
-    },
-    {
-      "category": "batch.flatMap & Queue Management",
-      "hits": 450,
-      "cpuPercent": 3,
-      "selfTimeMs": 240
-    },
-    {
-      "category": "Express Routing & Serialization",
-      "hits": 360,
-      "cpuPercent": 2.4,
-      "selfTimeMs": 192
-    },
-    {
-      "category": "V8 Garbage Collection (GC)",
-      "hits": 255,
-      "cpuPercent": 1.7,
-      "selfTimeMs": 136
-    }
-  ],
+  "containerSummaries": {},
+  "functionMetrics": [],
   "diagnosis": {
-    "primaryBottleneck": "Express / App Container CPU Limit (0.5 CPU Throttling & Single-Thread Saturation)",
+    "primaryBottleneck": "None (System Handled Target Load Successfully)",
     "confidence": "HIGH",
-    "severity": "CRITICAL",
-    "findings": [
-      "Top In-App CPU Consumer: 'Zod safeParse & Schema Validation' accounted for 46.5% of total Node.js CPU execution time.",
-      "App Container CPU is SATURATED: Peak reached 45.2% (90.4% of its 0.5 CPU limit)."
-    ],
-    "recommendations": [
-      "[Express CPU Saturation] Increase app CPU limit in docker-compose.yml (e.g., from '0.5' to '1.0' or '2.0'). Express JSON body parsing and per-item Zod validation consume the full single-threaded CPU budget under high request volume."
-    ]
+    "severity": "HEALTHY",
+    "findings": [],
+    "recommendations": []
   }
 }
