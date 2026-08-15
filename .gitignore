@@ -1,3 +1,35 @@
-node_modules
-dist
+# Dependencies
+node_modules/
+
+# Build outputs
+dist/
+build/
+
+# Environment variables
 .env
+.env.*
+!.env.example
+
+# Benchmark & Profiler outputs / Test scripts
+scripts/
+profiler-output/
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+
+# Coverage & test output
+coverage/
+.nyc_output/
+
+# IDE & Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
