@@ -6,7 +6,11 @@ import {
   aggregateQuerySchema,
 } from "../validators/logs.validator";
 import type { ValidLog } from "../validators/logs.validator";
-import { insertLogs, queryLogs, aggregateLogs } from "../services/logs.service";
+import {
+  enqueueLogs,
+  queryLogs,
+  aggregateLogs,
+} from "../services/logs.service";
 import { extractAttributeFilters } from "../utils/extractAttributeFilters";
 import { encodeCursor, decodeCursor } from "../utils/cursor";
 
@@ -14,7 +18,6 @@ type RejectedLog = {
   index: number;
   reason: string;
 };
-
 
 const logsRouter = Router();
 
@@ -26,6 +29,7 @@ logsRouter.post("/", async (req, res) => {
       error: "Invalid request body",
     });
   }
+
   const logs = requestResult.data.logs;
   const accepted: ValidLog[] = [];
   const rejected: RejectedLog[] = [];
@@ -54,7 +58,7 @@ logsRouter.post("/", async (req, res) => {
     });
   }
 
-  await insertLogs(accepted);
+  await enqueueLogs(accepted);
 
   return res.status(200).json({
     accepted: accepted.length,
@@ -76,7 +80,6 @@ logsRouter.get("/", async (req, res) => {
   }
 
   const query = queryResult.data;
-
   const attributeFilters = extractAttributeFilters(req.query);
 
   let cursor;
@@ -94,7 +97,6 @@ logsRouter.get("/", async (req, res) => {
   const logs = await queryLogs(query, attributeFilters, cursor);
 
   const hasMore = logs.length > query.limit;
-
   const page = hasMore ? logs.slice(0, query.limit) : logs;
 
   const lastLog = page[page.length - 1]!;
@@ -126,13 +128,9 @@ logsRouter.get("/aggregate", async (req, res) => {
   }
 
   const query = queryResult.data;
-
   const attributeFilters = extractAttributeFilters(req.query);
 
-  const buckets = await aggregateLogs(
-    query,
-    attributeFilters,
-  );
+  const buckets = await aggregateLogs(query, attributeFilters);
 
   return res.status(200).json({
     buckets: buckets.map((bucket) => ({

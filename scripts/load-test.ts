@@ -1,3 +1,5 @@
+import process from "node:process";
+
 type LoadTestOptions = {
   url: string;
   rate: number;
@@ -13,11 +15,11 @@ type LogResponse = {
 function getArg(name: string, defaultValue: string): string {
   const index = process.argv.indexOf(name);
 
-  if (index === -1 || index + 1 >= process.argv.length) {
+  if (index === -1) {
     return defaultValue;
   }
 
-  return process.argv[index + 1];
+  return process.argv[index + 1] ?? defaultValue;
 }
 
 function parseOptions(): LoadTestOptions {
@@ -145,12 +147,26 @@ async function main() {
       .catch((error: unknown) => {
         errors++;
 
-        const message =
-          error instanceof Error
-            ? error.message
-            : String(error);
+        if (error instanceof Error) {
+          const cause =
+            error.cause instanceof Error
+              ? {
+                  name: error.cause.name,
+                  message: error.cause.message,
+                  code: (error.cause as { code?: unknown }).code,
+                  errno: (error.cause as { errno?: unknown }).errno,
+                  syscall: (error.cause as { syscall?: unknown }).syscall,
+                }
+              : error.cause;
 
-        console.error(`Request failed: ${message}`);
+          console.error("Request failed:", {
+            name: error.name,
+            message: error.message,
+            cause,
+          });
+        } else {
+          console.error("Request failed:", error);
+        }
       })
       .finally(() => {
         completedRequests++;

@@ -3,66 +3,162 @@ import type {
   LogsQuery,
   AggregateQuery,
 } from "../validators/logs.validator";
-import { db } from "../db";
+import { db, pool } from "../db";
 import { logs as logsTable } from "../db/schema";
 import type { LogCursor } from "../utils/cursor";
 
+import { from as copyFrom } from "pg-copy-streams"; // to use COPY instead of INSERT
+
 import { and, desc, eq, gte, lt, sql } from "drizzle-orm";
 
-// تعريف النوع بشكل صحيح لـ pg driver
-type PreparedInsert = {
-  execute: (params: Record<string, unknown>) => Promise<unknown>;
+// ==========================================
+// Batch Ingest Aggregator
+// ==========================================
+const FLUSH_MAX_LOGS = 5000; // حجم الدفعة الكبيرة
+const FLUSH_WAIT_MS = 20;    // أقصى تأخير قبل الفلاش
+const MAX_PENDING_LOGS = 10000; // حد أمان للذاكرة
+
+type PendingInsert = {
+  logs: ValidLog[];
+  resolve: () => void;
+  reject: (error: unknown) => void;
 };
 
-const preparedInsertCache = new Map<number, PreparedInsert>();
+let pendingInserts: PendingInsert[] = [];
+let pendingLogCount = 0;
+let flushTimer: ReturnType<typeof setTimeout> | null = null;
+let flushing = false;
 
-function getPreparedInsert(batchSize: number): PreparedInsert {
-  const cached = preparedInsertCache.get(batchSize);
-
-  if (cached !== undefined) {
-    return cached;
-  }
-
-  // إنشاء placeholders ديناميكياً لكن داخل Drizzle (آمن 100%)
-  const rows = Array.from({ length: batchSize }, (_, index) => ({
-    timestamp: sql.placeholder(`timestamp_${index}`),
-    level: sql.placeholder(`level_${index}`),
-    service: sql.placeholder(`service_${index}`),
-    message: sql.placeholder(`message_${index}`),
-    attributes: sql.placeholder(`attributes_${index}`),
-  }));
-
-  // prepare() هنا هو السر: يخبر pg بعمل cache للـ query plan
-  const prepared = db
-    .insert(logsTable)
-    .values(rows)
-    .prepare(`insert_logs_${batchSize}`);
-
-  preparedInsertCache.set(batchSize, prepared);
-
-  return prepared;
+function backpressureError(): Error {
+  const error = new Error("ingestion queue is full");
+  error.name = "BackpressureError";
+  return error;
 }
 
-export async function insertLogs(logs: ValidLog[]): Promise<void> {
+function clearFlushTimer() {
+  if (flushTimer !== null) {
+    clearTimeout(flushTimer);
+    flushTimer = null;
+  }
+}
+
+function scheduleFlushIfNeeded() {
+  if (pendingInserts.length === 0) return;
+
+  if (pendingLogCount >= FLUSH_MAX_LOGS) {
+    clearFlushTimer();
+    void flushPendingInserts();
+  } else if (flushTimer === null) {
+    flushTimer = setTimeout(() => {
+      flushTimer = null;
+      void flushPendingInserts();
+    }, FLUSH_WAIT_MS);
+  }
+}
+
+async function flushPendingInserts() {
+  if (flushing || pendingInserts.length === 0) return;
+
+  flushing = true;
+  clearFlushTimer();
+
+  const batch = pendingInserts;
+  pendingInserts = [];
+  pendingLogCount = 0;
+
+  const logs = batch.flatMap((entry) => entry.logs);
+
+  try {
+    await insertLogsBulk(logs);
+
+    for (const entry of batch) {
+      entry.resolve();
+    }
+  } catch (error) {
+    for (const entry of batch) {
+      entry.reject(error);
+    }
+  } finally {
+    flushing = false;
+    scheduleFlushIfNeeded();
+  }
+}
+
+/**
+ * إدخال دفعة كبيرة بواسطة UNNEST
+ */
+async function insertLogsBulk(logs: ValidLog[]): Promise<void> {
   if (logs.length === 0) return;
 
-  const prepared = getPreparedInsert(logs.length);
-  const params: Record<string, unknown> = {};
+  const client = await pool.connect();
 
+  try {
+    const copyStream = client.query(
+      copyFrom(
+        `COPY logs (timestamp, level, service, message, attributes)
+         FROM STDIN
+         WITH (FORMAT csv)`,
+      ),
+    );
 
-  for (let i = 0; i < logs.length; i++) {
-    const log = logs[i];
-    if (log === undefined) continue;
+    await new Promise<void>((resolve, reject) => {
+      copyStream.on("finish", resolve);
+      copyStream.on("error", reject);
 
-    params[`timestamp_${i}`] = new Date(log.timestamp);
-    params[`level_${i}`] = log.level;
-    params[`service_${i}`] = log.service;
-    params[`message_${i}`] = log.message;
-    params[`attributes_${i}`] = log.attributes;
+      let index = 0;
+
+      const writeNext = () => {
+        while (index < logs.length) {
+          const log = logs[index++];
+
+          if (log === undefined) {
+            continue;
+          }
+
+          const row = [
+            log.timestamp,
+            log.level,
+            log.service,
+            log.message,
+            JSON.stringify(log.attributes),
+          ]
+            .map((value) => `"${String(value).replace(/"/g, '""')}"`)
+            .join(",");
+
+          if (!copyStream.write(`${row}\n`)) {
+            copyStream.once("drain", writeNext);
+            return;
+          }
+        }
+
+        copyStream.end();
+      };
+
+      writeNext();
+    });
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * إضافة سجلات إلى قائمة الانتظار المجمّعة
+ */
+export function enqueueLogs(logs: ValidLog[]): Promise<void> {
+  if (pendingLogCount + logs.length > MAX_PENDING_LOGS) {
+    return Promise.reject(backpressureError());
   }
 
-  await prepared.execute(params);
+  return new Promise((resolve, reject) => {
+    pendingInserts.push({ logs, resolve, reject });
+    pendingLogCount += logs.length;
+    scheduleFlushIfNeeded();
+  });
 }
+
+// ==========================================
+// Query Functions
+// ==========================================
 
 export async function queryLogs(
   query: LogsQuery,

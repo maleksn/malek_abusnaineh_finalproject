@@ -3,9 +3,9 @@ import { Pool } from "pg";
 import { drizzle } from "drizzle-orm/node-postgres";
 import { migrate } from "drizzle-orm/node-postgres/migrator";
 
-const pool = new Pool({
+export const pool = new Pool({
   connectionString: process.env.DATABASE_URL!,
-  max: 40, // pool size
+  max: 10, // pool size
 });
 
 export const db = drizzle(pool);
