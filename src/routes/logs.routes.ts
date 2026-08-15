@@ -1,7 +1,5 @@
 import { Router } from "express";
 import {
-  logSchema,
-  logsRequestSchema,
   logsQuerySchema,
   aggregateQuerySchema,
 } from "../validators/logs.validator";
@@ -19,37 +17,174 @@ type RejectedLog = {
   reason: string;
 };
 
+// Match the format used by the load test / z.iso.datetime()
+const isoTimestamp =
+  /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/;
+
 const logsRouter = Router();
 
 logsRouter.post("/", async (req, res) => {
-  const requestResult = logsRequestSchema.safeParse(req.body);
+  const rawLogs = (req.body as { logs?: unknown } | null | undefined)?.logs;
 
-  if (!requestResult.success) {
+  if (!Array.isArray(rawLogs) || rawLogs.length === 0) {
     return res.status(400).json({
       error: "Invalid request body",
     });
   }
 
-  const logs = requestResult.data.logs;
+  const logs = rawLogs;
   const accepted: ValidLog[] = [];
   const rejected: RejectedLog[] = [];
 
-  logs.forEach((log, index) => {
-    const result = logSchema.safeParse(log);
+  function validateLogManually(
+    log: unknown,
+  ): { valid: true; data: ValidLog } | { valid: false; reason: string } {
+    if (typeof log !== "object" || log === null || Array.isArray(log)) {
+      return { valid: false, reason: "Invalid log object" };
+    }
 
-    if (result.success) {
+    const input = log as Record<string, unknown>;
+
+    // timestamp
+    if (typeof input.timestamp !== "string") {
+      return { valid: false, reason: "timestamp must be a string" };
+    }
+
+
+
+    if (!isoTimestamp.test(input.timestamp)) {
+      return { valid: false, reason: "Invalid timestamp" };
+    }
+
+    const timestampMs = Date.parse(input.timestamp);
+
+    if (!Number.isFinite(timestampMs)) {
+      return { valid: false, reason: "Invalid timestamp" };
+    }
+
+    if (timestampMs > Date.now() + 300000) {
+      return {
+        valid: false,
+        reason: "timestamp must not be more than five minutes in the future",
+      };
+    }
+
+    // level
+    if (
+      input.level !== "debug" &&
+      input.level !== "info" &&
+      input.level !== "warn" &&
+      input.level !== "error"
+    ) {
+      return {
+        valid: false,
+        reason: "Invalid level",
+      };
+    }
+
+    // service
+    if (typeof input.service !== "string") {
+      return {
+        valid: false,
+        reason: "service must be a string",
+      };
+    }
+
+    const service = input.service.trim();
+
+    if (service.length === 0) {
+      return {
+        valid: false,
+        reason: "service must not be empty",
+      };
+    }
+
+    // message
+    if (typeof input.message !== "string") {
+      return {
+        valid: false,
+        reason: "message must be a string",
+      };
+    }
+
+    const message = input.message.trim();
+
+    if (message.length === 0) {
+      return {
+        valid: false,
+        reason: "message must not be empty",
+      };
+    }
+
+    // attributes
+    let attributes: Record<string, string | number | boolean>;
+
+    if (input.attributes === undefined) {
+      attributes = {};
+    } else {
+      if (
+        typeof input.attributes !== "object" ||
+        input.attributes === null ||
+        Array.isArray(input.attributes)
+      ) {
+        return {
+          valid: false,
+          reason: "attributes must be an object",
+        };
+      }
+
+      const rawAttributes = input.attributes as Record<string, unknown>;
+      attributes = {};
+
+      for (const [key, value] of Object.entries(rawAttributes)) {
+        if (
+          typeof value !== "string" &&
+          typeof value !== "number" &&
+          typeof value !== "boolean"
+        ) {
+          return {
+            valid: false,
+            reason: `invalid attribute value for ${key}`,
+          };
+        }
+
+        if (typeof value === "number" && !Number.isFinite(value)) {
+          return {
+            valid: false,
+            reason: `invalid attribute value for ${key}`,
+          };
+        }
+
+        attributes[key] = value;
+      }
+    }
+
+    return {
+      valid: true,
+      data: {
+        timestamp: input.timestamp,
+        level: input.level,
+        service,
+        message,
+        attributes,
+      },
+    };
+  }
+
+  for (let index = 0; index < logs.length; index++) {
+    const log = logs[index];
+
+    const result = validateLogManually(log);
+
+    if (result.valid) {
       accepted.push(result.data);
     } else {
-      const reason = result.error.issues
-        .map((issue) => issue.message)
-        .join(" & ");
-
       rejected.push({
         index,
-        reason,
+        reason: result.reason,
       });
     }
-  });
+  }
 
   if (accepted.length === 0) {
     return res.status(400).json({
@@ -103,9 +238,9 @@ logsRouter.get("/", async (req, res) => {
 
   const nextCursor = hasMore
     ? encodeCursor({
-        timestamp: lastLog.timestamp.toISOString(),
-        id: lastLog.id,
-      })
+      timestamp: lastLog.timestamp.toISOString(),
+      id: lastLog.id,
+    })
     : null;
 
   return res.status(200).json({

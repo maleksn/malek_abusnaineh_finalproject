@@ -15,8 +15,9 @@ import { and, desc, eq, gte, lt, sql } from "drizzle-orm";
 // Batch Ingest Aggregator
 // ==========================================
 const FLUSH_MAX_LOGS = 5000; // حجم الدفعة الكبيرة
-const FLUSH_WAIT_MS = 20;    // أقصى تأخير قبل الفلاش
+const FLUSH_WAIT_MS = 20; // أقصى تأخير قبل الفلاش
 const MAX_PENDING_LOGS = 10000; // حد أمان للذاكرة
+const COPY_CHUNK_SIZE = 65536; // 64 KB
 
 type PendingInsert = {
   logs: ValidLog[];
@@ -84,6 +85,14 @@ async function flushPendingInserts() {
   }
 }
 
+function csvField(value: string): string {
+  if (value.indexOf('"') === -1) {
+    return `"${value}"`;
+  }
+
+  return `"${value.replaceAll('"', '""')}"`;
+}
+
 /**
  * إدخال دفعة كبيرة بواسطة UNNEST
  */
@@ -106,6 +115,7 @@ async function insertLogsBulk(logs: ValidLog[]): Promise<void> {
       copyStream.on("error", reject);
 
       let index = 0;
+      let buffer = "";
 
       const writeNext = () => {
         while (index < logs.length) {
@@ -115,18 +125,36 @@ async function insertLogsBulk(logs: ValidLog[]): Promise<void> {
             continue;
           }
 
-          const row = [
-            log.timestamp,
-            log.level,
-            log.service,
-            log.message,
-            JSON.stringify(log.attributes),
-          ]
-            .map((value) => `"${String(value).replace(/"/g, '""')}"`)
-            .join(",");
+          const row =
+            csvField(log.timestamp) +
+            "," +
+            csvField(log.level) +
+            "," +
+            csvField(log.service) +
+            "," +
+            csvField(log.message) +
+            "," +
+            csvField(JSON.stringify(log.attributes));
 
-          if (!copyStream.write(`${row}\n`)) {
-            copyStream.once("drain", writeNext);
+          buffer += row + "\n";
+
+          if (buffer.length >= COPY_CHUNK_SIZE) {
+            const chunk = buffer;
+            buffer = "";
+            if (!copyStream.write(chunk)) {
+              copyStream.once("drain", writeNext);
+              return;
+            }
+          }
+        }
+
+        if (buffer.length > 0) {
+          const chunk = buffer;
+          buffer = "";
+          if (!copyStream.write(chunk)) {
+            copyStream.once("drain", () => {
+              copyStream.end();
+            });
             return;
           }
         }
