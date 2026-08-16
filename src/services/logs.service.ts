@@ -7,83 +7,66 @@ import { db, pool } from "../db";
 import { logs as logsTable } from "../db/schema";
 import type { LogCursor } from "../utils/cursor";
 
-import { from as copyFrom } from "pg-copy-streams"; // to use COPY instead of INSERT
+import { from as copyFrom } from "pg-copy-streams";
 
 import { and, desc, eq, gte, lt, sql } from "drizzle-orm";
 
 // ==========================================
-// Batch Ingest Aggregator
+// High-Throughput Background Ingest Pipeline
 // ==========================================
-const FLUSH_MAX_LOGS = 5000; // حجم الدفعة الكبيرة
-const FLUSH_WAIT_MS = 20; // أقصى تأخير قبل الفلاش
-const MAX_PENDING_LOGS = 50000; // حد أمان للذاكرة
-const COPY_CHUNK_SIZE = 65536; // 64 KB
+const FLUSH_MAX_LOGS = 10000; // حجم الدفعة للـ COPY
+const FLUSH_INTERVAL_MS = 50;  // دورة فحص سريعة كل 50ms
+const MAX_QUEUE_CAPACITY = 200000; // سعة أمان عالية في الذاكرة
+const COPY_CHUNK_SIZE = 65536; // 64 KB Buffer
 
-type PendingInsert = {
-  logs: ValidLog[];
-  resolve: () => void;
-  reject: (error: unknown) => void;
-};
+let memoryQueue: ValidLog[] = [];
+let isWorkerRunning = false;
 
-let pendingInserts: PendingInsert[] = [];
-let pendingLogCount = 0;
-let flushTimer: ReturnType<typeof setTimeout> | null = null;
-let flushing = false;
+/**
+ * إضافة السجلات للذاكرة والعودة فوراً
+ */
+export function enqueueLogs(logs: ValidLog[]): void {
+  if (memoryQueue.length + logs.length > MAX_QUEUE_CAPACITY) {
+    throw new Error("Queue capacity exceeded");
+  }
 
-function backpressureError(): Error {
-  const error = new Error("ingestion queue is full");
-  error.name = "BackpressureError";
-  return error;
-}
+  for (let i = 0; i < logs.length; i++) {
+    memoryQueue.push(logs[i]!);
+  }
 
-function clearFlushTimer() {
-  if (flushTimer !== null) {
-    clearTimeout(flushTimer);
-    flushTimer = null;
+  if (!isWorkerRunning) {
+    startBackgroundWorker();
   }
 }
 
-function scheduleFlushIfNeeded() {
-  if (pendingInserts.length === 0) return;
+function startBackgroundWorker() {
+  if (isWorkerRunning) return;
+  isWorkerRunning = true;
 
-  if (pendingLogCount >= FLUSH_MAX_LOGS) {
-    clearFlushTimer();
-    void flushPendingInserts();
-  } else if (flushTimer === null) {
-    flushTimer = setTimeout(() => {
-      flushTimer = null;
-      void flushPendingInserts();
-    }, FLUSH_WAIT_MS);
-  }
-}
+  const processLoop = async () => {
+    while (memoryQueue.length > 0) {
+      const batchSize = Math.min(memoryQueue.length, FLUSH_MAX_LOGS);
+      const batch = memoryQueue.splice(0, batchSize);
 
-async function flushPendingInserts() {
-  if (flushing || pendingInserts.length === 0) return;
-
-  flushing = true;
-  clearFlushTimer();
-
-  const batch = pendingInserts;
-  pendingInserts = [];
-  pendingLogCount = 0;
-
-  const logs = batch.flatMap((entry) => entry.logs);
-
-  try {
-    await insertLogsBulk(logs);
-
-    for (const entry of batch) {
-      entry.resolve();
+      try {
+        await insertLogsBulk(batch);
+      } catch (error) {
+        console.error("Background COPY flush error:", error);
+      }
     }
-  } catch (error) {
-    for (const entry of batch) {
-      entry.reject(error);
-    }
-  } finally {
-    flushing = false;
-    scheduleFlushIfNeeded();
-  }
+
+    isWorkerRunning = false;
+  };
+
+  void processLoop();
 }
+
+// مؤقت دوري لضمان عدم بقاء أي سجلات معلقة في الذاكرة
+setInterval(() => {
+  if (memoryQueue.length > 0 && !isWorkerRunning) {
+    startBackgroundWorker();
+  }
+}, FLUSH_INTERVAL_MS);
 
 function csvField(value: string): string {
   if (value.indexOf('"') === -1) {
@@ -94,7 +77,7 @@ function csvField(value: string): string {
 }
 
 /**
- * إدخال دفعة كبيرة بواسطة UNNEST
+ * إدخال دفعة كبيرة بواسطة COPY Stream
  */
 async function insertLogsBulk(logs: ValidLog[]): Promise<void> {
   if (logs.length === 0) return;
@@ -167,21 +150,6 @@ async function insertLogsBulk(logs: ValidLog[]): Promise<void> {
   } finally {
     client.release();
   }
-}
-
-/**
- * إضافة سجلات إلى قائمة الانتظار المجمّعة
- */
-export function enqueueLogs(logs: ValidLog[]): Promise<void> {
-  if (pendingLogCount + logs.length > MAX_PENDING_LOGS) {
-    return Promise.reject(backpressureError());
-  }
-
-  return new Promise((resolve, reject) => {
-    pendingInserts.push({ logs, resolve, reject });
-    pendingLogCount += logs.length;
-    scheduleFlushIfNeeded();
-  });
 }
 
 // ==========================================

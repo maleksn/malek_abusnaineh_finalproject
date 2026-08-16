@@ -192,9 +192,13 @@ logsRouter.post("/", async (req, res) => {
       rejected,
     });
   }
-
-  await enqueueLogs(accepted);
-
+  try {
+    enqueueLogs(accepted);
+  } catch (err) {
+    return res.status(503).json({
+      error: "Ingestion queue full, please retry",
+    });
+  }
   return res.status(200).json({
     accepted: accepted.length,
     rejected,
