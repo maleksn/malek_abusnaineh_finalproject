@@ -52,6 +52,10 @@ function startBackgroundWorker() {
       } catch (error) {
         console.error("Background COPY flush error:", error);
       }
+
+      if (memoryQueue.length > 0) {
+        await new Promise((resolve) => setTimeout(resolve, 15));
+      }
     }
 
     isWorkerRunning = false;
@@ -198,7 +202,7 @@ export async function queryLogs(
   }
 
   for (const [key, value] of Object.entries(attributeFilters)) {
-    conditions.push(sql`${logsTable.attributes} ->> ${key} = ${value}`);
+    conditions.push(sql`${logsTable.attributes} @> ${JSON.stringify({ [key]: value })}::jsonb`); // @> is faster than ->> for jsonb
   }
 
   return db
@@ -230,80 +234,66 @@ export interface AggregateBucketResult {
 
 // In-memory micro-cache for high-concurrency aggregate queries
 interface CacheEntry {
-  data: AggregateBucketResult[];
+  promise: Promise<AggregateBucketResult[]>;
   expiresAt: number;
 }
 const aggregateCache = new Map<string, CacheEntry>();
-
 export async function aggregateLogs(
   query: AggregateQuery,
   attributeFilters: Record<string, string>,
 ): Promise<AggregateBucketResult[]> {
-  // Check micro-cache (2-second TTL) to prevent thundering herd on single CPU
   const cacheKey = JSON.stringify({ query, attributeFilters });
   const now = Date.now();
   const cached = aggregateCache.get(cacheKey);
-
   if (cached !== undefined && cached.expiresAt > now) {
-    return cached.data;
+    return cached.promise;
   }
-
-  const bucketExpression = getBucketExpression(query.bucket);
-
-  const groupExpression =
-    query.group_by === "service"
-      ? logsTable.service
-      : query.group_by === "level"
-        ? logsTable.level
-        : sql<null>`NULL`;
-
-  const conditions = [
-    gte(logsTable.timestamp, new Date(query.since)),
-    lt(logsTable.timestamp, new Date(query.until)),
-  ];
-
-  if (query.service !== undefined) {
-    conditions.push(eq(logsTable.service, query.service));
-  }
-
-  if (query.level !== undefined) {
-    conditions.push(eq(logsTable.level, query.level));
-  }
-
-  if (query.q !== undefined) {
-    const term = `%${query.q}%`;
-    conditions.push(sql`${logsTable.message} ILIKE ${term}`);
-  }
-
-  for (const [key, value] of Object.entries(attributeFilters)) {
-    conditions.push(sql`${logsTable.attributes} ->> ${key} = ${value}`);
-  }
-
-  const groupByClause =
-    query.group_by !== undefined
-      ? [sql.raw("1"), sql.raw("2")]
-      : [sql.raw("1")];
-
-  const result = await db
-    .select({
-      start: bucketExpression,
-      group: groupExpression,
-      count: sql<number>`count(*)::int`,
-    })
-    .from(logsTable)
-    .where(and(...conditions))
-    .groupBy(...groupByClause)
-    .orderBy(sql.raw("1"));
-
-  const formattedResult: AggregateBucketResult[] = result.map((row) => ({
-    start: row.start,
-    group: row.group,
-    count: row.count,
-  }));
-
-  // Cache result for 2 seconds
-  aggregateCache.set(cacheKey, { data: formattedResult, expiresAt: now + 2000 });
-
+  const queryPromise = (async () => {
+    const bucketExpression = getBucketExpression(query.bucket);
+    const groupExpression =
+      query.group_by === "service"
+        ? logsTable.service
+        : query.group_by === "level"
+          ? logsTable.level
+          : sql<null>`NULL`;
+    const conditions = [
+      gte(logsTable.timestamp, new Date(query.since)),
+      lt(logsTable.timestamp, new Date(query.until)),
+    ];
+    if (query.service !== undefined) {
+      conditions.push(eq(logsTable.service, query.service));
+    }
+    if (query.level !== undefined) {
+      conditions.push(eq(logsTable.level, query.level));
+    }
+    if (query.q !== undefined) {
+      const term = `%${query.q}%`;
+      conditions.push(sql`${logsTable.message} ILIKE ${term}`);
+    }
+    for (const [key, value] of Object.entries(attributeFilters)) {
+      conditions.push(sql`${logsTable.attributes} @> ${JSON.stringify({ [key]: value })}::jsonb`);
+    }
+    const groupByClause =
+      query.group_by !== undefined
+        ? [sql.raw("1"), sql.raw("2")]
+        : [sql.raw("1")];
+    const result = await db
+      .select({
+        start: bucketExpression,
+        group: groupExpression,
+        count: sql<number>`count(*)::int`,
+      })
+      .from(logsTable)
+      .where(and(...conditions))
+      .groupBy(...groupByClause)
+      .orderBy(sql.raw("1"));
+    return result.map((row) => ({
+      start: row.start,
+      group: row.group,
+      count: row.count,
+    }));
+  })();
+  aggregateCache.set(cacheKey, { promise: queryPromise, expiresAt: now + 3000 });
   if (aggregateCache.size > 500) {
     for (const [key, entry] of aggregateCache) {
       if (entry.expiresAt <= now) {
@@ -311,6 +301,6 @@ export async function aggregateLogs(
       }
     }
   }
-
-  return formattedResult;
+  return queryPromise;
 }
+
