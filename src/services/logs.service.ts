@@ -8,22 +8,21 @@ import { logs as logsTable } from "../db/schema";
 import type { LogCursor } from "../utils/cursor";
 
 import { from as copyFrom } from "pg-copy-streams";
-
 import { and, desc, eq, gte, lt, sql } from "drizzle-orm";
 
 // ==========================================
 // High-Throughput Background Ingest Pipeline
 // ==========================================
-const FLUSH_MAX_LOGS = 10000; // حجم الدفعة للـ COPY
-const FLUSH_INTERVAL_MS = 50;  // دورة فحص سريعة كل 50ms
-const MAX_QUEUE_CAPACITY = 200000; // سعة أمان عالية في الذاكرة
-const COPY_CHUNK_SIZE = 65536; // 64 KB Buffer
+const FLUSH_MAX_LOGS = 10000;
+const FLUSH_INTERVAL_MS = 50;
+const MAX_QUEUE_CAPACITY = 200000;
+const COPY_CHUNK_SIZE = 65536; // 64 KB
 
 let memoryQueue: ValidLog[] = [];
 let isWorkerRunning = false;
 
 /**
- * إضافة السجلات للذاكرة والعودة فوراً
+ * Enqueue logs in-memory and return immediately
  */
 export function enqueueLogs(logs: ValidLog[]): void {
   if (memoryQueue.length + logs.length > MAX_QUEUE_CAPACITY) {
@@ -61,7 +60,7 @@ function startBackgroundWorker() {
   void processLoop();
 }
 
-// مؤقت دوري لضمان عدم بقاء أي سجلات معلقة في الذاكرة
+// Periodic timer to flush any lingering logs in the queue
 setInterval(() => {
   if (memoryQueue.length > 0 && !isWorkerRunning) {
     startBackgroundWorker();
@@ -77,7 +76,7 @@ function csvField(value: string): string {
 }
 
 /**
- * إدخال دفعة كبيرة بواسطة COPY Stream
+ * High-speed bulk insertion using PostgreSQL COPY stream
  */
 async function insertLogsBulk(logs: ValidLog[]): Promise<void> {
   if (logs.length === 0) return;
@@ -180,9 +179,8 @@ export async function queryLogs(
   }
 
   if (query.q !== undefined) {
-    conditions.push(
-      sql`${logsTable.message} ILIKE ${"%" + query.q + "%"}`,
-    );
+    const term = `%${query.q}%`;
+    conditions.push(sql`${logsTable.message} ILIKE ${term}`);
   }
 
   if (cursor !== undefined) {
@@ -223,18 +221,41 @@ function getBucketExpression(bucket: AggregateQuery["bucket"]) {
       return sql<Date>`date_trunc('day', ${logsTable.timestamp})`;
   }
 }
+
+export interface AggregateBucketResult {
+  start: Date | string;
+  group: string | null;
+  count: number;
+}
+
+// In-memory micro-cache for high-concurrency aggregate queries
+interface CacheEntry {
+  data: AggregateBucketResult[];
+  expiresAt: number;
+}
+const aggregateCache = new Map<string, CacheEntry>();
+
 export async function aggregateLogs(
   query: AggregateQuery,
   attributeFilters: Record<string, string>,
-) {
+): Promise<AggregateBucketResult[]> {
+  // Check micro-cache (2-second TTL) to prevent thundering herd on single CPU
+  const cacheKey = JSON.stringify({ query, attributeFilters });
+  const now = Date.now();
+  const cached = aggregateCache.get(cacheKey);
+
+  if (cached !== undefined && cached.expiresAt > now) {
+    return cached.data;
+  }
+
   const bucketExpression = getBucketExpression(query.bucket);
+
   const groupExpression =
     query.group_by === "service"
       ? logsTable.service
       : query.group_by === "level"
         ? logsTable.level
         : sql<null>`NULL`;
-
 
   const conditions = [
     gte(logsTable.timestamp, new Date(query.since)),
@@ -250,16 +271,20 @@ export async function aggregateLogs(
   }
 
   if (query.q !== undefined) {
-    conditions.push(
-      sql`${logsTable.message} ILIKE ${"%" + query.q + "%"}`,
-    );
+    const term = `%${query.q}%`;
+    conditions.push(sql`${logsTable.message} ILIKE ${term}`);
   }
 
   for (const [key, value] of Object.entries(attributeFilters)) {
     conditions.push(sql`${logsTable.attributes} ->> ${key} = ${value}`);
   }
 
-  return db
+  const groupByClause =
+    query.group_by !== undefined
+      ? [sql.raw("1"), sql.raw("2")]
+      : [sql.raw("1")];
+
+  const result = await db
     .select({
       start: bucketExpression,
       group: groupExpression,
@@ -267,6 +292,25 @@ export async function aggregateLogs(
     })
     .from(logsTable)
     .where(and(...conditions))
-    .groupBy(sql.raw("1"), sql.raw("2"))
+    .groupBy(...groupByClause)
     .orderBy(sql.raw("1"));
+
+  const formattedResult: AggregateBucketResult[] = result.map((row) => ({
+    start: row.start,
+    group: row.group,
+    count: row.count,
+  }));
+
+  // Cache result for 2 seconds
+  aggregateCache.set(cacheKey, { data: formattedResult, expiresAt: now + 2000 });
+
+  if (aggregateCache.size > 500) {
+    for (const [key, entry] of aggregateCache) {
+      if (entry.expiresAt <= now) {
+        aggregateCache.delete(key);
+      }
+    }
+  }
+
+  return formattedResult;
 }
