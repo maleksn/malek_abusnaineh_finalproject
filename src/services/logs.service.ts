@@ -181,7 +181,7 @@ export async function queryLogs(
 
   if (query.q !== undefined) {
     conditions.push(
-      sql`LOWER(${logsTable.message}) LIKE LOWER(${"%" + query.q + "%"})`,
+      sql`${logsTable.message} ILIKE ${"%" + query.q + "%"}`,
     );
   }
 
@@ -211,43 +211,30 @@ export async function queryLogs(
     .limit(query.limit + 1);
 }
 
-function getBucketSeconds(bucket: AggregateQuery["bucket"]): number {
+function getBucketExpression(bucket: AggregateQuery["bucket"]) {
   switch (bucket) {
     case "1m":
-      return 60;
-
+      return sql<Date>`date_trunc('minute', ${logsTable.timestamp})`;
     case "5m":
-      return 300;
-
+      return sql<Date>`to_timestamp(floor(extract(epoch from ${logsTable.timestamp}) / 300) * 300)`;
     case "1h":
-      return 3600;
-
+      return sql<Date>`date_trunc('hour', ${logsTable.timestamp})`;
     case "1d":
-      return 86400;
+      return sql<Date>`date_trunc('day', ${logsTable.timestamp})`;
   }
 }
-
 export async function aggregateLogs(
   query: AggregateQuery,
   attributeFilters: Record<string, string>,
 ) {
-  const bucketSeconds = getBucketSeconds(query.bucket);
-
-  const bucketExpression = sql<Date>`
-    to_timestamp(
-      floor(
-        extract(epoch from ${logsTable.timestamp})
-        / ${bucketSeconds}
-      ) * ${bucketSeconds}
-    )
-  `;
-
+  const bucketExpression = getBucketExpression(query.bucket);
   const groupExpression =
     query.group_by === "service"
       ? logsTable.service
       : query.group_by === "level"
         ? logsTable.level
         : sql<null>`NULL`;
+
 
   const conditions = [
     gte(logsTable.timestamp, new Date(query.since)),
@@ -264,7 +251,7 @@ export async function aggregateLogs(
 
   if (query.q !== undefined) {
     conditions.push(
-      sql`LOWER(${logsTable.message}) LIKE LOWER(${"%" + query.q + "%"})`,
+      sql`${logsTable.message} ILIKE ${"%" + query.q + "%"}`,
     );
   }
 
