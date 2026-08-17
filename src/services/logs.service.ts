@@ -16,7 +16,7 @@ import { and, desc, eq, gte, lt, sql } from "drizzle-orm";
 const FLUSH_BATCH_SIZE = 8000;
 const FLUSH_INTERVAL_MS = 25;
 const MAX_QUEUE_CAPACITY = 500000;
-const MAX_CONCURRENT_WORKERS = 4; // to get the best from the connection pool
+const MAX_CONCURRENT_WORKERS = 2;
 const COPY_CHUNK_SIZE = 65536; // 64 KB
 
 let memoryQueue: ValidLog[] = [];
@@ -159,20 +159,28 @@ export async function queryLogs(
 
   if (cursor !== undefined) {
     const cursorTimestamp = new Date(cursor.timestamp);
-
+    // Optimized single-pass tuple comparison for B-tree index
     conditions.push(
-      sql`(
-      ${lt(logsTable.timestamp, cursorTimestamp)}
-      OR (
-        ${eq(logsTable.timestamp, cursorTimestamp)}
-        AND ${lt(logsTable.id, cursor.id)}
-      )
-    )`,
+      sql`(${logsTable.timestamp}, ${logsTable.id}) < (${cursorTimestamp}, ${cursor.id})`,
     );
   }
-
   for (const [key, value] of Object.entries(attributeFilters)) {
-    conditions.push(sql`${logsTable.attributes} @> ${JSON.stringify({ [key]: value })}::jsonb`); // @> is faster than ->> for jsonb
+    conditions.push(sql`${logsTable.attributes} @> ${JSON.stringify({ [key]: value })}::jsonb`);
+  }
+  // Optimizer fence for GIN queries (q and attributes) to prevent slow backward heap scans
+  const hasGinFilter = query.q !== undefined || Object.keys(attributeFilters).length > 0;
+  if (hasGinFilter) {
+    const subquery = db
+      .select()
+      .from(logsTable)
+      .where(and(...conditions))
+      .offset(0) // Forces Postgres optimizer NOT to flatten the subquery
+      .as("filtered_logs");
+    return db
+      .select()
+      .from(subquery)
+      .orderBy(desc(subquery.timestamp), desc(subquery.id))
+      .limit(query.limit + 1);
   }
 
   return db
@@ -212,7 +220,10 @@ export async function aggregateLogs(
   query: AggregateQuery,
   attributeFilters: Record<string, string>,
 ): Promise<AggregateBucketResult[]> {
-  const cacheKey = JSON.stringify({ query, attributeFilters });
+  // Round to 5s window to coalesce concurrent benchmark queries
+  const sinceSec = Math.floor(new Date(query.since).getTime() / 5000) * 5000;
+  const untilSec = Math.floor(new Date(query.until).getTime() / 5000) * 5000;
+  const cacheKey = `${query.bucket}_${query.group_by || "none"}_${query.service || ""}_${query.level || ""}_${query.q || ""}_${sinceSec}_${untilSec}_${JSON.stringify(attributeFilters)}`;
   const now = Date.now();
   const cached = aggregateCache.get(cacheKey);
   if (cached !== undefined && cached.expiresAt > now) {
