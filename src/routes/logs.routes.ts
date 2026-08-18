@@ -3,9 +3,9 @@ import {
   logsQuerySchema,
   aggregateQuerySchema,
 } from "../validators/logs.validator";
-import type { ValidLog } from "../validators/logs.validator";
+import type { ValidLog, LogsQuery } from "../validators/logs.validator";
 import {
-  enqueueLogs,
+  enqueueCsvChunk,
   queryLogs,
   aggregateLogs,
 } from "../services/logs.service";
@@ -27,7 +27,7 @@ const isoTimestamp =
 
 const logsRouter = Router();
 
-logsRouter.post("/", async (req, res) => {
+logsRouter.post("/", (req, res) => {
   const rawLogs = (req.body as { logs?: unknown } | null | undefined)?.logs;
 
   if (!Array.isArray(rawLogs) || rawLogs.length === 0) {
@@ -37,196 +37,195 @@ logsRouter.post("/", async (req, res) => {
   }
 
   const logs = rawLogs;
-  const accepted: ValidLog[] = [];
+  let validCsvChunk = "";
+  let acceptedCount = 0;
   const rejected: RejectedLog[] = [];
-
-  function validateLogManually(
-    log: unknown,
-  ): { valid: true; data: ValidLog } | { valid: false; reason: string } {
-    if (typeof log !== "object" || log === null || Array.isArray(log)) {
-      return { valid: false, reason: "Invalid log object" };
-    }
-
-    const input = log as Record<string, unknown>;
-
-    // timestamp
-    if (typeof input.timestamp !== "string") {
-      return { valid: false, reason: "timestamp must be a string" };
-    }
-
-
-
-    if (!isoTimestamp.test(input.timestamp)) {
-      return { valid: false, reason: "Invalid timestamp" };
-    }
-
-    const timestampMs = Date.parse(input.timestamp);
-
-    if (!Number.isFinite(timestampMs)) {
-      return { valid: false, reason: "Invalid timestamp" };
-    }
-
-    if (timestampMs > Date.now() + 300000) {
-      return {
-        valid: false,
-        reason: "timestamp must not be more than five minutes in the future",
-      };
-    }
-
-    // level
-    if (
-      input.level !== "debug" &&
-      input.level !== "info" &&
-      input.level !== "warn" &&
-      input.level !== "error"
-    ) {
-      return {
-        valid: false,
-        reason: "Invalid level",
-      };
-    }
-
-    // service
-    if (typeof input.service !== "string") {
-      return {
-        valid: false,
-        reason: "service must be a string",
-      };
-    }
-
-    const service = input.service.trim();
-
-    if (service.length === 0) {
-      return {
-        valid: false,
-        reason: "service must not be empty",
-      };
-    }
-
-    // message
-    if (typeof input.message !== "string") {
-      return {
-        valid: false,
-        reason: "message must be a string",
-      };
-    }
-
-    const message = input.message.trim();
-
-    if (message.length === 0) {
-      return {
-        valid: false,
-        reason: "message must not be empty",
-      };
-    }
-
-    // attributes
-    let attributes: Record<string, string | number | boolean>;
-
-    if (input.attributes === undefined) {
-      attributes = {};
-    } else {
-      if (
-        typeof input.attributes !== "object" ||
-        input.attributes === null ||
-        Array.isArray(input.attributes)
-      ) {
-        return {
-          valid: false,
-          reason: "attributes must be an object",
-        };
-      }
-
-      const rawAttributes = input.attributes as Record<string, unknown>;
-      attributes = {};
-
-      for (const [key, value] of Object.entries(rawAttributes)) {
-        if (
-          typeof value !== "string" &&
-          typeof value !== "number" &&
-          typeof value !== "boolean"
-        ) {
-          return {
-            valid: false,
-            reason: `invalid attribute value for ${key}`,
-          };
-        }
-
-        if (typeof value === "number" && !Number.isFinite(value)) {
-          return {
-            valid: false,
-            reason: `invalid attribute value for ${key}`,
-          };
-        }
-
-        attributes[key] = value;
-      }
-    }
-
-    return {
-      valid: true,
-      data: {
-        timestamp: input.timestamp,
-        level: input.level,
-        service,
-        message,
-        attributes,
-      },
-    };
-  }
+  const maxFutureTimestamp = Date.now() + 300000;
 
   for (let index = 0; index < logs.length; index++) {
     const log = logs[index];
 
-    const result = validateLogManually(log);
+    if (typeof log !== "object" || log === null || Array.isArray(log)) {
+      rejected.push({ index, reason: "Invalid log object" });
+      continue;
+    }
 
-    if (result.valid) {
-      accepted.push(result.data);
-    } else {
+    const input = log as Record<string, unknown>;
+
+    // 1. timestamp validation
+    const ts = input.timestamp;
+    if (typeof ts !== "string") {
+      rejected.push({ index, reason: "timestamp must be a string" });
+      continue;
+    }
+
+    if (!isoTimestamp.test(ts)) {
+      rejected.push({ index, reason: "Invalid timestamp" });
+      continue;
+    }
+
+    const timestampMs = Date.parse(ts);
+    if (!Number.isFinite(timestampMs)) {
+      rejected.push({ index, reason: "Invalid timestamp" });
+      continue;
+    }
+
+    if (timestampMs > maxFutureTimestamp) {
       rejected.push({
         index,
-        reason: result.reason,
+        reason: "timestamp must not be more than five minutes in the future",
       });
+      continue;
     }
+
+    // 2. level validation
+    const lvl = input.level;
+    if (
+      lvl !== "debug" &&
+      lvl !== "info" &&
+      lvl !== "warn" &&
+      lvl !== "error"
+    ) {
+      rejected.push({ index, reason: "Invalid level" });
+      continue;
+    }
+
+    // 3. service validation
+    const srv = input.service;
+    if (typeof srv !== "string") {
+      rejected.push({ index, reason: "service must be a string" });
+      continue;
+    }
+
+    const service =
+      srv.charCodeAt(0) <= 32 || srv.charCodeAt(srv.length - 1) <= 32
+        ? srv.trim()
+        : srv;
+    if (service.length === 0) {
+      rejected.push({ index, reason: "service must not be empty" });
+      continue;
+    }
+
+    // 4. message validation
+    const msg = input.message;
+    if (typeof msg !== "string") {
+      rejected.push({ index, reason: "message must be a string" });
+      continue;
+    }
+
+    const message =
+      msg.charCodeAt(0) <= 32 || msg.charCodeAt(msg.length - 1) <= 32
+        ? msg.trim()
+        : msg;
+    if (message.length === 0) {
+      rejected.push({ index, reason: "message must not be empty" });
+      continue;
+    }
+
+    // 5. attributes validation & direct CSV serialization
+    let attrJson = '"{}"';
+    const rawAttrs = input.attributes;
+    if (rawAttrs !== undefined) {
+      if (
+        typeof rawAttrs !== "object" ||
+        rawAttrs === null ||
+        Array.isArray(rawAttrs)
+      ) {
+        rejected.push({ index, reason: "attributes must be an object" });
+        continue;
+      }
+
+      const attrsObj = rawAttrs as Record<string, unknown>;
+      let hasInvalidAttr = false;
+      const keys = Object.keys(attrsObj);
+
+      if (keys.length > 0) {
+        for (let k = 0; k < keys.length; k++) {
+          const key = keys[k]!;
+          const val = attrsObj[key];
+          if (
+            (typeof val !== "string" &&
+              typeof val !== "number" &&
+              typeof val !== "boolean") ||
+            (typeof val === "number" && !Number.isFinite(val))
+          ) {
+            rejected.push({ index, reason: `invalid attribute value for ${key}` });
+            hasInvalidAttr = true;
+            break;
+          }
+        }
+        if (hasInvalidAttr) continue;
+        const jsonStr = JSON.stringify(attrsObj);
+        attrJson =
+          jsonStr.indexOf('"') === -1
+            ? `"${jsonStr}"`
+            : `"${jsonStr.replaceAll('"', '""')}"`;
+      }
+    }
+
+    // Direct fast CSV formatting
+    const escapedMsg =
+      message.indexOf('"') === -1
+        ? `"${message}"`
+        : `"${message.replaceAll('"', '""')}"`;
+
+    validCsvChunk += `"${ts}","${lvl}","${service}",${escapedMsg},${attrJson}\n`;
+    acceptedCount++;
   }
 
-  if (accepted.length === 0) {
+  if (acceptedCount === 0) {
     return res.status(400).json({
       accepted: 0,
       rejected,
     });
   }
+
   try {
-    enqueueLogs(accepted);
+    enqueueCsvChunk(validCsvChunk, acceptedCount);
   } catch (err) {
     return res.status(503).json({
       error: "Ingestion queue full, please retry",
     });
   }
+
+  if (rejected.length === 0) {
+    res.setHeader("Content-Type", "application/json");
+    return res.status(200).send(`{"accepted":${acceptedCount},"rejected":[]}`);
+  }
+
   return res.status(200).json({
-    accepted: accepted.length,
+    accepted: acceptedCount,
     rejected,
   });
 });
 
 logsRouter.get("/", async (req, res) => {
-  const queryResult = logsQuerySchema.safeParse(req.query);
+  // Fast path for read-after-write query: /logs?limit=20
+  const isSimpleLimit =
+    Object.keys(req.query).length === 1 && req.query.limit !== undefined;
 
-  if (!queryResult.success) {
-    const error = queryResult.error.issues
-      .map((issue) => issue.message)
-      .join(" & ");
+  let query: LogsQuery;
+  let attributeFilters: Record<string, string> = {};
 
-    return res.status(400).json({
-      error,
-    });
+  if (isSimpleLimit) {
+    const limitNum = Number(req.query.limit);
+    if (!Number.isInteger(limitNum) || limitNum < 1 || limitNum > 1000) {
+      return res.status(400).json({ error: "limit must be between 1 and 1000" });
+    }
+    query = { limit: limitNum };
+  } else {
+    const queryResult = logsQuerySchema.safeParse(req.query);
+    if (!queryResult.success) {
+      const error = queryResult.error.issues
+        .map((issue) => issue.message)
+        .join(" & ");
+      return res.status(400).json({ error });
+    }
+    query = queryResult.data;
+    attributeFilters = extractAttributeFilters(req.query);
   }
 
-  const query = queryResult.data;
-  const attributeFilters = extractAttributeFilters(req.query);
-
   let cursor;
-
   if (query.cursor !== undefined) {
     try {
       cursor = decodeCursor(query.cursor);
@@ -242,14 +241,18 @@ logsRouter.get("/", async (req, res) => {
   const hasMore = logs.length > query.limit;
   const page = hasMore ? logs.slice(0, query.limit) : logs;
 
-  const lastLog = page[page.length - 1]!;
+  const lastLog = page[page.length - 1];
 
-  const nextCursor = hasMore
-    ? encodeCursor({
-      timestamp: lastLog.timestamp.toISOString(),
-      id: lastLog.id,
-    })
-    : null;
+  const nextCursor =
+    hasMore && lastLog
+      ? encodeCursor({
+        timestamp:
+          lastLog.timestamp instanceof Date
+            ? lastLog.timestamp.toISOString()
+            : new Date(String(lastLog.timestamp)).toISOString(),
+        id: Number(lastLog.id),
+      })
+      : null;
 
   return res.status(200).json({
     logs: page,
@@ -277,7 +280,10 @@ logsRouter.get("/aggregate", async (req, res) => {
 
   return res.status(200).json({
     buckets: buckets.map((bucket) => ({
-      start: new Date(String(bucket.start)).toISOString(),
+      start:
+        bucket.start instanceof Date
+          ? bucket.start.toISOString()
+          : new Date(String(bucket.start)).toISOString(),
       group: bucket.group,
       count: bucket.count,
     })),

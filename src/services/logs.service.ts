@@ -11,64 +11,52 @@ import { from as copyFrom } from "pg-copy-streams";
 import { and, desc, eq, gte, lt, sql } from "drizzle-orm";
 
 // ===================================================
-// High-Throughput Robust Background Ingest Pipeline
+// Single-Stream Dedicated High-Throughput Ingest Engine
 // ===================================================
-const FLUSH_BATCH_SIZE = 4000;
-const FLUSH_INTERVAL_MS = 5;
-const MAX_QUEUE_CAPACITY = 30000;
+const FLUSH_CHUNK_BATCH = 40; // 40 chunks = 4,000 logs per COPY batch
+const MAX_QUEUE_LOGS = 100000;
 
 let logQueue: string[] = [];
+let queuedLogsCount = 0;
 let isFlushing = false;
 
 /**
- * Enqueue logs in-memory, pre-serialized into CSV to ensure minimal heap allocation
+ * Enqueue a pre-serialized CSV chunk directly into in-memory queue
  */
-export function enqueueLogs(logs: ValidLog[]): void {
-  if (logQueue.length + logs.length > MAX_QUEUE_CAPACITY) {
+export function enqueueCsvChunk(chunk: string, count: number): void {
+  if (queuedLogsCount + count > MAX_QUEUE_LOGS) {
     throw new Error("Queue capacity exceeded");
   }
 
-  for (let i = 0; i < logs.length; i++) {
-    const log = logs[i]!;
-    const attrJson =
-      !log.attributes || Object.keys(log.attributes).length === 0
-        ? '"{}"'
-        : `"${JSON.stringify(log.attributes).replaceAll('"', '""')}"`;
-
-    const msg =
-      log.message.indexOf('"') === -1
-        ? `"${log.message}"`
-        : `"${log.message.replaceAll('"', '""')}"`;
-
-    logQueue.push(
-      `"${log.timestamp}","${log.level}","${log.service}",${msg},${attrJson}\n`,
-    );
-  }
+  logQueue.push(chunk);
+  queuedLogsCount += count;
 
   if (!isFlushing) {
-    void flushQueue();
+    void runFlushLoop();
   }
 }
 
-async function flushQueue(): Promise<void> {
+async function runFlushLoop(): Promise<void> {
   if (isFlushing) return;
   isFlushing = true;
 
   try {
     while (logQueue.length > 0) {
-      const batch = logQueue.splice(0, FLUSH_BATCH_SIZE);
-      if (batch.length === 0) break;
+      const batch = logQueue.splice(0, FLUSH_CHUNK_BATCH);
+      const batchPayload = batch.join("");
 
       try {
-        await insertCsvBatch(batch);
+        await insertCsvPayload(batchPayload);
       } catch (err) {
         console.error("Background COPY flush error:", err);
       }
+
+      queuedLogsCount = Math.max(0, queuedLogsCount - batch.length * 100);
     }
   } finally {
     isFlushing = false;
     if (logQueue.length > 0) {
-      void flushQueue();
+      void runFlushLoop();
     }
   }
 }
@@ -76,15 +64,15 @@ async function flushQueue(): Promise<void> {
 // Periodic timer to flush any lingering logs in the queue
 setInterval(() => {
   if (logQueue.length > 0 && !isFlushing) {
-    void flushQueue();
+    void runFlushLoop();
   }
-}, FLUSH_INTERVAL_MS);
+}, 5);
 
 /**
  * High-speed bulk insertion using PostgreSQL COPY stream
  */
-async function insertCsvBatch(lines: string[]): Promise<void> {
-  if (lines.length === 0) return;
+async function insertCsvPayload(payload: string): Promise<void> {
+  if (!payload) return;
   let client;
   try {
     client = await pool.connect();
@@ -103,43 +91,10 @@ async function insertCsvBatch(lines: string[]): Promise<void> {
     );
 
     await new Promise<void>((resolve, reject) => {
-      let isDone = false;
-      const onDone = () => {
-        if (!isDone) {
-          isDone = true;
-          resolve();
-        }
-      };
-      const onError = (err: Error) => {
-        if (!isDone) {
-          isDone = true;
-          reject(err);
-        }
-      };
+      copyStream.on("finish", resolve);
+      copyStream.on("error", reject);
 
-      copyStream.on("finish", onDone);
-      copyStream.on("error", onError);
-
-      let idx = 0;
-      const CHUNK_SIZE = 1000;
-
-      const writeNext = () => {
-        while (idx < lines.length) {
-          const end = Math.min(idx + CHUNK_SIZE, lines.length);
-          let chunk = "";
-          for (; idx < end; idx++) {
-            chunk += lines[idx]!;
-          }
-
-          if (!copyStream.write(chunk)) {
-            copyStream.once("drain", writeNext);
-            return;
-          }
-        }
-        copyStream.end();
-      };
-
-      writeNext();
+      copyStream.end(payload);
     });
   } catch (err) {
     console.error("COPY stream error:", err);
@@ -159,6 +114,35 @@ export async function queryLogs(
   attributeFilters: Record<string, string>,
   cursor?: LogCursor,
 ) {
+  const hasAttrFilters = Object.keys(attributeFilters).length > 0;
+  const isSimpleReadAfterWrite =
+    query.service === undefined &&
+    query.level === undefined &&
+    query.since === undefined &&
+    query.until === undefined &&
+    query.q === undefined &&
+    cursor === undefined &&
+    !hasAttrFilters;
+
+  if (isSimpleReadAfterWrite) {
+    const res = await pool.query<{
+      id: number;
+      timestamp: Date;
+      level: "debug" | "info" | "warn" | "error";
+      service: string;
+      message: string;
+      attributes: Record<string, unknown>;
+      createdAt: Date;
+    }>(
+      `SELECT id, timestamp, level, service, message, attributes, created_at AS "createdAt"
+       FROM logs
+       ORDER BY timestamp DESC, id DESC
+       LIMIT $1`,
+      [query.limit + 1],
+    );
+    return res.rows;
+  }
+
   const conditions = [];
 
   if (query.service !== undefined) {
@@ -239,6 +223,46 @@ export async function aggregateLogs(
   query: AggregateQuery,
   attributeFilters: Record<string, string>,
 ): Promise<AggregateBucketResult[]> {
+  const hasAttrFilters = Object.keys(attributeFilters).length > 0;
+  
+  // Fast path for standard bucket aggregate queries using direct pg pool query
+  if (!hasAttrFilters && query.q === undefined) {
+    const params: (string | Date)[] = [new Date(query.since), new Date(query.until)];
+    const whereClauses: string[] = ["timestamp >= $1", "timestamp < $2"];
+
+    if (query.service !== undefined) {
+      params.push(query.service);
+      whereClauses.push(`service = $${params.length}`);
+    }
+
+    if (query.level !== undefined) {
+      params.push(query.level);
+      whereClauses.push(`level = $${params.length}`);
+    }
+
+    let bucketSql = "date_trunc('minute', timestamp)";
+    if (query.bucket === "5m") {
+      bucketSql = "to_timestamp(floor(extract(epoch from timestamp) / 300) * 300)";
+    } else if (query.bucket === "1h") {
+      bucketSql = "date_trunc('hour', timestamp)";
+    } else if (query.bucket === "1d") {
+      bucketSql = "date_trunc('day', timestamp)";
+    }
+
+    const groupCol = query.group_by === "service" ? "service" : query.group_by === "level" ? "level" : "NULL::text";
+    const groupBySql = query.group_by !== undefined ? "GROUP BY 1, 2 ORDER BY 1" : "GROUP BY 1 ORDER BY 1";
+
+    const sqlText = `
+      SELECT ${bucketSql} AS start, ${groupCol} AS "group", count(*)::int AS count
+      FROM logs
+      WHERE ${whereClauses.join(" AND ")}
+      ${groupBySql}
+    `;
+
+    const res = await pool.query<{ start: Date | string; group: string | null; count: number }>(sqlText, params);
+    return res.rows;
+  }
+
   const bucketExpression = getBucketExpression(query.bucket);
   const groupExpression =
     query.group_by === "service"
