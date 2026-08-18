@@ -11,77 +11,88 @@ import { from as copyFrom } from "pg-copy-streams";
 import { and, desc, eq, gte, lt, sql } from "drizzle-orm";
 
 // ===================================================
-// High-Throughput Concurrent Background Ingest Pipeline
+// High-Throughput Robust Background Ingest Pipeline
 // ===================================================
-const FLUSH_BATCH_SIZE = 5000;
+const FLUSH_BATCH_SIZE = 4000;
 const FLUSH_INTERVAL_MS = 5;
-const MAX_QUEUE_CAPACITY = 20000;
-const MAX_CONCURRENT_WORKERS = 4;
+const MAX_QUEUE_CAPACITY = 30000;
 
-let chunkQueue: ValidLog[][] = [];
-let queueHead = 0;
-let totalQueuedLogs = 0;
-let activeWorkers = 0;
+let logQueue: string[] = [];
+let isFlushing = false;
 
 /**
- * Enqueue logs in-memory and trigger concurrent workers
+ * Enqueue logs in-memory, pre-serialized into CSV to ensure minimal heap allocation
  */
 export function enqueueLogs(logs: ValidLog[]): void {
-  if (totalQueuedLogs + logs.length > MAX_QUEUE_CAPACITY) {
+  if (logQueue.length + logs.length > MAX_QUEUE_CAPACITY) {
     throw new Error("Queue capacity exceeded");
   }
-  chunkQueue.push(logs);
-  totalQueuedLogs += logs.length;
-  triggerWorkers();
-}
 
-function triggerWorkers(): void {
-  while (activeWorkers < MAX_CONCURRENT_WORKERS && queueHead < chunkQueue.length) {
-    activeWorkers++;
-    void runWorker();
+  for (let i = 0; i < logs.length; i++) {
+    const log = logs[i]!;
+    const attrJson =
+      !log.attributes || Object.keys(log.attributes).length === 0
+        ? '"{}"'
+        : `"${JSON.stringify(log.attributes).replaceAll('"', '""')}"`;
+
+    const msg =
+      log.message.indexOf('"') === -1
+        ? `"${log.message}"`
+        : `"${log.message.replaceAll('"', '""')}"`;
+
+    logQueue.push(
+      `"${log.timestamp}","${log.level}","${log.service}",${msg},${attrJson}\n`,
+    );
+  }
+
+  if (!isFlushing) {
+    void flushQueue();
   }
 }
 
-async function runWorker(): Promise<void> {
-  try {
-    while (queueHead < chunkQueue.length) {
-      const chunk = chunkQueue[queueHead++];
-      if (!chunk || chunk.length === 0) continue;
-      totalQueuedLogs -= chunk.length;
+async function flushQueue(): Promise<void> {
+  if (isFlushing) return;
+  isFlushing = true;
 
-      // Free array memory immediately when drained
-      if (queueHead >= chunkQueue.length) {
-        chunkQueue = [];
-        queueHead = 0;
-        totalQueuedLogs = 0;
-      }
+  try {
+    while (logQueue.length > 0) {
+      const batch = logQueue.splice(0, FLUSH_BATCH_SIZE);
+      if (batch.length === 0) break;
 
       try {
-        await insertLogsBulk(chunk);
-      } catch (error) {
-        console.error("Background COPY flush error:", error);
+        await insertCsvBatch(batch);
+      } catch (err) {
+        console.error("Background COPY flush error:", err);
       }
     }
   } finally {
-    activeWorkers--;
-    if (queueHead < chunkQueue.length) {
-      triggerWorkers();
+    isFlushing = false;
+    if (logQueue.length > 0) {
+      void flushQueue();
     }
   }
 }
 
 // Periodic timer to flush any lingering logs in the queue
 setInterval(() => {
-  if (queueHead < chunkQueue.length) {
-    triggerWorkers();
+  if (logQueue.length > 0 && !isFlushing) {
+    void flushQueue();
   }
 }, FLUSH_INTERVAL_MS);
+
 /**
- * High-speed bulk insertion using PostgreSQL COPY stream with low-GC chunked serialization
+ * High-speed bulk insertion using PostgreSQL COPY stream
  */
-async function insertLogsBulk(logs: ValidLog[]): Promise<void> {
-  if (logs.length === 0) return;
-  const client = await pool.connect();
+async function insertCsvBatch(lines: string[]): Promise<void> {
+  if (lines.length === 0) return;
+  let client;
+  try {
+    client = await pool.connect();
+  } catch (err) {
+    console.error("Failed to connect to database for COPY:", err);
+    return;
+  }
+
   try {
     const copyStream = client.query(
       copyFrom(
@@ -90,34 +101,36 @@ async function insertLogsBulk(logs: ValidLog[]): Promise<void> {
          WITH (FORMAT csv)`,
       ),
     );
+
     await new Promise<void>((resolve, reject) => {
-      copyStream.on("finish", resolve);
-      copyStream.on("error", reject);
-      let index = 0;
-      const CHUNK_LOGS = 500;
+      let isDone = false;
+      const onDone = () => {
+        if (!isDone) {
+          isDone = true;
+          resolve();
+        }
+      };
+      const onError = (err: Error) => {
+        if (!isDone) {
+          isDone = true;
+          reject(err);
+        }
+      };
+
+      copyStream.on("finish", onDone);
+      copyStream.on("error", onError);
+
+      let idx = 0;
+      const CHUNK_SIZE = 1000;
 
       const writeNext = () => {
-        while (index < logs.length) {
-          const end = Math.min(index + CHUNK_LOGS, logs.length);
-          const lines: string[] = [];
-          for (; index < end; index++) {
-            const log = logs[index]!;
-            const attrJson =
-              !log.attributes || Object.keys(log.attributes).length === 0
-                ? '"{}"'
-                : `"${JSON.stringify(log.attributes).replaceAll('"', '""')}"`;
-
-            const msg =
-              log.message.indexOf('"') === -1
-                ? `"${log.message}"`
-                : `"${log.message.replaceAll('"', '""')}"`;
-
-            lines.push(
-              `"${log.timestamp}","${log.level}","${log.service}",${msg},${attrJson}\n`,
-            );
+        while (idx < lines.length) {
+          const end = Math.min(idx + CHUNK_SIZE, lines.length);
+          let chunk = "";
+          for (; idx < end; idx++) {
+            chunk += lines[idx]!;
           }
 
-          const chunk = lines.join("");
           if (!copyStream.write(chunk)) {
             copyStream.once("drain", writeNext);
             return;
@@ -128,8 +141,12 @@ async function insertLogsBulk(logs: ValidLog[]): Promise<void> {
 
       writeNext();
     });
+  } catch (err) {
+    console.error("COPY stream error:", err);
   } finally {
-    client.release();
+    if (client) {
+      client.release();
+    }
   }
 }
 

@@ -5,7 +5,13 @@ import { migrate } from "drizzle-orm/node-postgres/migrator";
 
 export const pool = new Pool({
   connectionString: process.env.DATABASE_URL!,
-  max: 25, // pool size
+  max: 20, // pool size
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 5000,
+});
+
+pool.on("error", (err) => {
+  console.error("Unexpected error on idle database client:", err);
 });
 
 export const db = drizzle(pool);

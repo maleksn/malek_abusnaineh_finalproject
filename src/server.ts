@@ -2,6 +2,13 @@ import app from "./app";
 import { checkDatabaseConnection, runMigrations } from "./db";
 import { markAppReady, markAppNotReady } from "./utils/appState";
 import { startRetentionWorker } from "./services/retention.service";
+ 
+process.on("unhandledRejection", (reason) => {
+  console.error("Unhandled Rejection:", reason);
+});
+process.on("uncaughtException", (error) => {
+  console.error("Uncaught Exception:", error);
+});
 
 const PORT = 8080;
 
