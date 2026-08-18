@@ -6,13 +6,17 @@
     "dev": "tsx watch src/server.ts",
     "build": "tsc --noEmit && esbuild src/server.ts --bundle --platform=node --target=node22 --format=cjs --outfile=dist/server.cjs",
     "start": "node dist/server.cjs",
-    "load-test": "tsx scripts/load-test.ts"
+    "load-test": "tsx scripts/load-test.ts",
+    "benchmark": "node ./node_modules/@foothill/logs-benchmark/dist/index.js --compose ./docker-compose.yml --seed 6122026 --generator-cpus 2",
+    "benchmark:full": "node ./node_modules/@foothill/logs-benchmark/dist/index.js --compose ./docker-compose.yml --full --seed 6122026 --generator-cpus 2",
+    "benchmark:checks": "node ./node_modules/@foothill/logs-benchmark/dist/index.js --compose ./docker-compose.yml --checks-only"
   },
   "keywords": [],
   "author": "Malek Abu Snaineh",
   "license": "MIT",
   "description": "log ingestion and query service built with TypeScript, Express, Drizzle ORM, and PostgreSQL.",
   "devDependencies": {
+    "@foothill/logs-benchmark": "github:Ahmad-Abbas-Foothill/logs-benchmark-cli#992d9c8",
     "@types/express": "^5.0.6",
     "@types/node": "^26.2.0",
     "@types/pg": "^8.21.0",

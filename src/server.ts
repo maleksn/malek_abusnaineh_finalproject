@@ -1,6 +1,7 @@
 import app from "./app";
 import { checkDatabaseConnection, runMigrations } from "./db";
 import { markAppReady, markAppNotReady } from "./utils/appState";
+import { startRetentionWorker } from "./services/retention.service";
 
 const PORT = 8080;
 
@@ -79,6 +80,8 @@ async function startServer(): Promise<void> {
 
   markAppReady();
   console.log("Application is ready.");
+
+  startRetentionWorker();
 
   await monitorDatabase();
 }

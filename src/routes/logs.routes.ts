@@ -9,6 +9,10 @@ import {
   queryLogs,
   aggregateLogs,
 } from "../services/logs.service";
+import {
+  purgeExpiredLogs,
+  getRetentionStatus,
+} from "../services/retention.service";
 import { extractAttributeFilters } from "../utils/extractAttributeFilters";
 import { encodeCursor, decodeCursor } from "../utils/cursor";
 
@@ -277,6 +281,22 @@ logsRouter.get("/aggregate", async (req, res) => {
       group: bucket.group,
       count: bucket.count,
     })),
+  });
+});
+
+// retention routes
+logsRouter.get("/retention/status", (_req, res) => {
+  return res.status(200).json(getRetentionStatus());
+});
+
+logsRouter.post("/retention/cleanup", async (req, res) => {
+  const days = req.body?.days !== undefined ? Number(req.body.days) : undefined;
+  const batchSize = req.body?.batch_size !== undefined ? Number(req.body.batch_size) : undefined;
+  const result = await purgeExpiredLogs(days, batchSize);
+  return res.status(200).json({
+    success: true,
+    deleted_count: result.deletedCount,
+    duration_ms: result.durationMs,
   });
 });
 

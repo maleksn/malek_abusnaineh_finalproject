@@ -13,65 +13,71 @@ import { and, desc, eq, gte, lt, sql } from "drizzle-orm";
 // ===================================================
 // High-Throughput Concurrent Background Ingest Pipeline
 // ===================================================
-const FLUSH_BATCH_SIZE = 8000;
-const FLUSH_INTERVAL_MS = 25;
-const MAX_QUEUE_CAPACITY = 500000;
-const MAX_CONCURRENT_WORKERS = 2;
-const COPY_CHUNK_SIZE = 65536; // 64 KB
+const FLUSH_BATCH_SIZE = 5000;
+const FLUSH_INTERVAL_MS = 5;
+const MAX_QUEUE_CAPACITY = 20000;
+const MAX_CONCURRENT_WORKERS = 4;
 
-let memoryQueue: ValidLog[] = [];
+let chunkQueue: ValidLog[][] = [];
+let queueHead = 0;
+let totalQueuedLogs = 0;
 let activeWorkers = 0;
+
 /**
  * Enqueue logs in-memory and trigger concurrent workers
  */
 export function enqueueLogs(logs: ValidLog[]): void {
-  if (memoryQueue.length + logs.length > MAX_QUEUE_CAPACITY) {
+  if (totalQueuedLogs + logs.length > MAX_QUEUE_CAPACITY) {
     throw new Error("Queue capacity exceeded");
   }
-  for (let i = 0; i < logs.length; i++) {
-    memoryQueue.push(logs[i]!);
-  }
+  chunkQueue.push(logs);
+  totalQueuedLogs += logs.length;
   triggerWorkers();
 }
+
 function triggerWorkers(): void {
-  while (activeWorkers < MAX_CONCURRENT_WORKERS && memoryQueue.length > 0) {
+  while (activeWorkers < MAX_CONCURRENT_WORKERS && queueHead < chunkQueue.length) {
     activeWorkers++;
     void runWorker();
   }
 }
+
 async function runWorker(): Promise<void> {
   try {
-    while (memoryQueue.length > 0) {
-      const batchSize = Math.min(memoryQueue.length, FLUSH_BATCH_SIZE);
-      const batch = memoryQueue.splice(0, batchSize);
-      if (batch.length === 0) break;
+    while (queueHead < chunkQueue.length) {
+      const chunk = chunkQueue[queueHead++];
+      if (!chunk || chunk.length === 0) continue;
+      totalQueuedLogs -= chunk.length;
+
+      // Free array memory immediately when drained
+      if (queueHead >= chunkQueue.length) {
+        chunkQueue = [];
+        queueHead = 0;
+        totalQueuedLogs = 0;
+      }
+
       try {
-        await insertLogsBulk(batch);
+        await insertLogsBulk(chunk);
       } catch (error) {
         console.error("Background COPY flush error:", error);
       }
     }
   } finally {
     activeWorkers--;
-    if (memoryQueue.length > 0) {
+    if (queueHead < chunkQueue.length) {
       triggerWorkers();
     }
   }
 }
+
 // Periodic timer to flush any lingering logs in the queue
 setInterval(() => {
-  if (memoryQueue.length > 0) {
+  if (queueHead < chunkQueue.length) {
     triggerWorkers();
   }
 }, FLUSH_INTERVAL_MS);
-function escapeCsv(value: string): string {
-  if (value.indexOf('"') === -1) {
-    return `"${value}"`;
-  }
-  return `"${value.replaceAll('"', '""')}"`;
-}
 /**
- * High-speed bulk insertion using PostgreSQL COPY stream with pre-allocated buffer
+ * High-speed bulk insertion using PostgreSQL COPY stream with low-GC chunked serialization
  */
 async function insertLogsBulk(logs: ValidLog[]): Promise<void> {
   if (logs.length === 0) return;
@@ -88,36 +94,38 @@ async function insertLogsBulk(logs: ValidLog[]): Promise<void> {
       copyStream.on("finish", resolve);
       copyStream.on("error", reject);
       let index = 0;
-      let buffer = "";
+      const CHUNK_LOGS = 500;
+
       const writeNext = () => {
         while (index < logs.length) {
-          const log = logs[index++];
-          if (!log) continue;
-          buffer +=
-            `"${log.timestamp}","${log.level}","${log.service}",` +
-            escapeCsv(log.message) +
-            "," +
-            escapeCsv(JSON.stringify(log.attributes)) +
-            "\n";
-          if (buffer.length >= COPY_CHUNK_SIZE) {
-            const chunk = buffer;
-            buffer = "";
-            if (!copyStream.write(chunk)) {
-              copyStream.once("drain", writeNext);
-              return;
-            }
+          const end = Math.min(index + CHUNK_LOGS, logs.length);
+          const lines: string[] = [];
+          for (; index < end; index++) {
+            const log = logs[index]!;
+            const attrJson =
+              !log.attributes || Object.keys(log.attributes).length === 0
+                ? '"{}"'
+                : `"${JSON.stringify(log.attributes).replaceAll('"', '""')}"`;
+
+            const msg =
+              log.message.indexOf('"') === -1
+                ? `"${log.message}"`
+                : `"${log.message.replaceAll('"', '""')}"`;
+
+            lines.push(
+              `"${log.timestamp}","${log.level}","${log.service}",${msg},${attrJson}\n`,
+            );
           }
-        }
-        if (buffer.length > 0) {
-          const chunk = buffer;
-          buffer = "";
+
+          const chunk = lines.join("");
           if (!copyStream.write(chunk)) {
-            copyStream.once("drain", () => copyStream.end());
+            copyStream.once("drain", writeNext);
             return;
           }
         }
         copyStream.end();
       };
+
       writeNext();
     });
   } finally {
@@ -210,78 +218,57 @@ export interface AggregateBucketResult {
   count: number;
 }
 
-// In-memory micro-cache for high-concurrency aggregate queries
-interface CacheEntry {
-  promise: Promise<AggregateBucketResult[]>;
-  expiresAt: number;
-}
-const aggregateCache = new Map<string, CacheEntry>();
 export async function aggregateLogs(
   query: AggregateQuery,
   attributeFilters: Record<string, string>,
 ): Promise<AggregateBucketResult[]> {
-  // Round to 5s window to coalesce concurrent benchmark queries
-  const sinceSec = Math.floor(new Date(query.since).getTime() / 5000) * 5000;
-  const untilSec = Math.floor(new Date(query.until).getTime() / 5000) * 5000;
-  const cacheKey = `${query.bucket}_${query.group_by || "none"}_${query.service || ""}_${query.level || ""}_${query.q || ""}_${sinceSec}_${untilSec}_${JSON.stringify(attributeFilters)}`;
-  const now = Date.now();
-  const cached = aggregateCache.get(cacheKey);
-  if (cached !== undefined && cached.expiresAt > now) {
-    return cached.promise;
+  const bucketExpression = getBucketExpression(query.bucket);
+  const groupExpression =
+    query.group_by === "service"
+      ? logsTable.service
+      : query.group_by === "level"
+        ? logsTable.level
+        : sql<null>`NULL`;
+
+  const conditions = [
+    gte(logsTable.timestamp, new Date(query.since)),
+    lt(logsTable.timestamp, new Date(query.until)),
+  ];
+
+  if (query.service !== undefined) {
+    conditions.push(eq(logsTable.service, query.service));
   }
-  const queryPromise = (async () => {
-    const bucketExpression = getBucketExpression(query.bucket);
-    const groupExpression =
-      query.group_by === "service"
-        ? logsTable.service
-        : query.group_by === "level"
-          ? logsTable.level
-          : sql<null>`NULL`;
-    const conditions = [
-      gte(logsTable.timestamp, new Date(query.since)),
-      lt(logsTable.timestamp, new Date(query.until)),
-    ];
-    if (query.service !== undefined) {
-      conditions.push(eq(logsTable.service, query.service));
-    }
-    if (query.level !== undefined) {
-      conditions.push(eq(logsTable.level, query.level));
-    }
-    if (query.q !== undefined) {
-      const term = `%${query.q}%`;
-      conditions.push(sql`${logsTable.message} ILIKE ${term}`);
-    }
-    for (const [key, value] of Object.entries(attributeFilters)) {
-      conditions.push(sql`${logsTable.attributes} @> ${JSON.stringify({ [key]: value })}::jsonb`);
-    }
-    const groupByClause =
-      query.group_by !== undefined
-        ? [sql.raw("1"), sql.raw("2")]
-        : [sql.raw("1")];
-    const result = await db
-      .select({
-        start: bucketExpression,
-        group: groupExpression,
-        count: sql<number>`count(*)::int`,
-      })
-      .from(logsTable)
-      .where(and(...conditions))
-      .groupBy(...groupByClause)
-      .orderBy(sql.raw("1"));
-    return result.map((row) => ({
-      start: row.start,
-      group: row.group,
-      count: row.count,
-    }));
-  })();
-  aggregateCache.set(cacheKey, { promise: queryPromise, expiresAt: now + 3000 });
-  if (aggregateCache.size > 500) {
-    for (const [key, entry] of aggregateCache) {
-      if (entry.expiresAt <= now) {
-        aggregateCache.delete(key);
-      }
-    }
+  if (query.level !== undefined) {
+    conditions.push(eq(logsTable.level, query.level));
   }
-  return queryPromise;
+  if (query.q !== undefined) {
+    const term = `%${query.q}%`;
+    conditions.push(sql`${logsTable.message} ILIKE ${term}`);
+  }
+  for (const [key, value] of Object.entries(attributeFilters)) {
+    conditions.push(sql`${logsTable.attributes} @> ${JSON.stringify({ [key]: value })}::jsonb`);
+  }
+
+  const groupByClause =
+    query.group_by !== undefined
+      ? [sql.raw("1"), sql.raw("2")]
+      : [sql.raw("1")];
+
+  const result = await db
+    .select({
+      start: bucketExpression,
+      group: groupExpression,
+      count: sql<number>`count(*)::int`,
+    })
+    .from(logsTable)
+    .where(and(...conditions))
+    .groupBy(...groupByClause)
+    .orderBy(sql.raw("1"));
+
+  return result.map((row) => ({
+    start: row.start,
+    group: row.group,
+    count: row.count,
+  }));
 }
 
