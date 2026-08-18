@@ -43,6 +43,13 @@
       "when": 1786946385733,
       "tag": "0005_optimize_indexes",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1786946385734,
+      "tag": "0006_consolidate_indexes",
+      "breakpoints": true
     }
   ]
 }
