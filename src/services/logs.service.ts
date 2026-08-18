@@ -125,6 +125,8 @@ async function insertCsvPayload(payload: string): Promise<void> {
 
       copyStream.end(payload);
     });
+
+    await client.query("SELECT 1");
   } catch (err) {
     console.error("COPY stream error:", err);
   } finally {

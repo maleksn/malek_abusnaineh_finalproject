@@ -218,9 +218,6 @@ logsRouter.post("/", async (req, res) => {
 });
 
 logsRouter.get("/", async (req, res) => {
-  // Ensure any in-flight buffer is flushed for 100% read-after-write consistency
-  await flushCurrentBuffer();
-
   const queryResult = logsQuerySchema.safeParse(req.query);
   if (!queryResult.success) {
     const error = queryResult.error.issues
@@ -264,9 +261,6 @@ logsRouter.get("/", async (req, res) => {
 });
 
 logsRouter.get("/aggregate", async (req, res) => {
-  // Ensure any in-flight buffer is flushed for 100% read-after-write consistency
-  await flushCurrentBuffer();
-
   const queryResult = aggregateQuerySchema.safeParse(req.query);
 
   if (!queryResult.success) {
