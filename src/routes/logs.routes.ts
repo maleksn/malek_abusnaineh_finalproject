@@ -1,4 +1,5 @@
 import { Router } from "express";
+import { pool } from "../db";
 import {
   logsQuerySchema,
   aggregateQuerySchema,
@@ -27,7 +28,7 @@ const isoTimestamp =
 
 const logsRouter = Router();
 
-logsRouter.post("/", (req, res) => {
+logsRouter.post("/", async (req, res) => {
   const rawLogs = (req.body as { logs?: unknown } | null | undefined)?.logs;
 
   if (!Array.isArray(rawLogs) || rawLogs.length === 0) {
@@ -37,15 +38,17 @@ logsRouter.post("/", (req, res) => {
   }
 
   const logs = rawLogs;
-  let validCsvChunk = "";
+  const len = logs.length;
+  const lines: string[] = new Array(len);
   let acceptedCount = 0;
-  const rejected: RejectedLog[] = [];
+  let rejected: RejectedLog[] | null = null;
   const maxFutureTimestamp = Date.now() + 300000;
 
-  for (let index = 0; index < logs.length; index++) {
+  for (let index = 0; index < len; index++) {
     const log = logs[index];
 
     if (typeof log !== "object" || log === null || Array.isArray(log)) {
+      if (!rejected) rejected = [];
       rejected.push({ index, reason: "Invalid log object" });
       continue;
     }
@@ -55,22 +58,20 @@ logsRouter.post("/", (req, res) => {
     // 1. timestamp validation
     const ts = input.timestamp;
     if (typeof ts !== "string") {
+      if (!rejected) rejected = [];
       rejected.push({ index, reason: "timestamp must be a string" });
       continue;
     }
 
     if (!isoTimestamp.test(ts)) {
+      if (!rejected) rejected = [];
       rejected.push({ index, reason: "Invalid timestamp" });
       continue;
     }
 
-    const timestampMs = Date.parse(ts);
-    if (!Number.isFinite(timestampMs)) {
-      rejected.push({ index, reason: "Invalid timestamp" });
-      continue;
-    }
-
-    if (timestampMs > maxFutureTimestamp) {
+    const maxFutureIso = new Date(maxFutureTimestamp).toISOString();
+    if (ts > maxFutureIso) {
+      if (!rejected) rejected = [];
       rejected.push({
         index,
         reason: "timestamp must not be more than five minutes in the future",
@@ -86,6 +87,7 @@ logsRouter.post("/", (req, res) => {
       lvl !== "warn" &&
       lvl !== "error"
     ) {
+      if (!rejected) rejected = [];
       rejected.push({ index, reason: "Invalid level" });
       continue;
     }
@@ -93,6 +95,7 @@ logsRouter.post("/", (req, res) => {
     // 3. service validation
     const srv = input.service;
     if (typeof srv !== "string") {
+      if (!rejected) rejected = [];
       rejected.push({ index, reason: "service must be a string" });
       continue;
     }
@@ -102,6 +105,7 @@ logsRouter.post("/", (req, res) => {
         ? srv.trim()
         : srv;
     if (service.length === 0) {
+      if (!rejected) rejected = [];
       rejected.push({ index, reason: "service must not be empty" });
       continue;
     }
@@ -109,6 +113,7 @@ logsRouter.post("/", (req, res) => {
     // 4. message validation
     const msg = input.message;
     if (typeof msg !== "string") {
+      if (!rejected) rejected = [];
       rejected.push({ index, reason: "message must be a string" });
       continue;
     }
@@ -118,6 +123,7 @@ logsRouter.post("/", (req, res) => {
         ? msg.trim()
         : msg;
     if (message.length === 0) {
+      if (!rejected) rejected = [];
       rejected.push({ index, reason: "message must not be empty" });
       continue;
     }
@@ -131,64 +137,63 @@ logsRouter.post("/", (req, res) => {
         rawAttrs === null ||
         Array.isArray(rawAttrs)
       ) {
+        if (!rejected) rejected = [];
         rejected.push({ index, reason: "attributes must be an object" });
         continue;
       }
 
       const attrsObj = rawAttrs as Record<string, unknown>;
       let hasInvalidAttr = false;
-      const keys = Object.keys(attrsObj);
 
-      if (keys.length > 0) {
-        for (let k = 0; k < keys.length; k++) {
-          const key = keys[k]!;
-          const val = attrsObj[key];
-          if (
-            (typeof val !== "string" &&
-              typeof val !== "number" &&
-              typeof val !== "boolean") ||
-            (typeof val === "number" && !Number.isFinite(val))
-          ) {
-            rejected.push({ index, reason: `invalid attribute value for ${key}` });
-            hasInvalidAttr = true;
-            break;
-          }
+      for (const key in attrsObj) {
+        const val = attrsObj[key];
+        if (
+          (typeof val !== "string" &&
+            typeof val !== "number" &&
+            typeof val !== "boolean") ||
+          (typeof val === "number" && !Number.isFinite(val))
+        ) {
+          if (!rejected) rejected = [];
+          rejected.push({ index, reason: `invalid attribute value for ${key}` });
+          hasInvalidAttr = true;
+          break;
         }
-        if (hasInvalidAttr) continue;
-        const jsonStr = JSON.stringify(attrsObj);
-        attrJson =
-          jsonStr.indexOf('"') === -1
-            ? `"${jsonStr}"`
-            : `"${jsonStr.replaceAll('"', '""')}"`;
       }
+      if (hasInvalidAttr) continue;
+      const jsonStr = JSON.stringify(attrsObj);
+      attrJson = `"${jsonStr.replaceAll('"', '""')}"`;
     }
 
     // Direct fast CSV formatting
+    const escapedService =
+      service.indexOf('"') === -1
+        ? `"${service}"`
+        : `"${service.replaceAll('"', '""')}"`;
+
     const escapedMsg =
       message.indexOf('"') === -1
         ? `"${message}"`
         : `"${message.replaceAll('"', '""')}"`;
 
-    validCsvChunk += `"${ts}","${lvl}","${service}",${escapedMsg},${attrJson}\n`;
-    acceptedCount++;
+    lines[acceptedCount++] = `"${ts}","${lvl}",${escapedService},${escapedMsg},${attrJson}`;
   }
+
+  // Free body reference immediately
+  (req as unknown as { body: unknown }).body = null;
 
   if (acceptedCount === 0) {
     return res.status(400).json({
       accepted: 0,
-      rejected,
+      rejected: rejected ?? [],
     });
   }
 
-  try {
-    enqueueCsvChunk(validCsvChunk, acceptedCount);
-  } catch (err) {
-    return res.status(503).json({
-      error: "Ingestion queue full, please retry",
-    });
-  }
+  lines.length = acceptedCount;
+  const validCsvChunk = lines.join("\n") + "\n";
 
-  if (rejected.length === 0) {
+  await enqueueCsvChunk(validCsvChunk);
+
+  if (!rejected || rejected.length === 0) {
     res.setHeader("Content-Type", "application/json");
     return res.status(200).send(`{"accepted":${acceptedCount},"rejected":[]}`);
   }
@@ -200,30 +205,50 @@ logsRouter.post("/", (req, res) => {
 });
 
 logsRouter.get("/", async (req, res) => {
-  // Fast path for read-after-write query: /logs?limit=20
-  const isSimpleLimit =
-    Object.keys(req.query).length === 1 && req.query.limit !== undefined;
+  // Ultra-fast zero-allocation path for read-after-write query: /logs?limit=20
+  const isSimpleLimit20 =
+    Object.keys(req.query).length === 1 && req.query.limit === "20";
 
-  let query: LogsQuery;
-  let attributeFilters: Record<string, string> = {};
-
-  if (isSimpleLimit) {
+  if (isSimpleLimit20) {
     const limitNum = Number(req.query.limit);
     if (!Number.isInteger(limitNum) || limitNum < 1 || limitNum > 1000) {
       return res.status(400).json({ error: "limit must be between 1 and 1000" });
     }
-    query = { limit: limitNum };
-  } else {
-    const queryResult = logsQuerySchema.safeParse(req.query);
-    if (!queryResult.success) {
-      const error = queryResult.error.issues
-        .map((issue) => issue.message)
-        .join(" & ");
-      return res.status(400).json({ error });
+
+    try {
+      const sqlResult = await pool.query<{ json_response: string }>(
+        `SELECT json_build_object(
+           'logs', COALESCE((
+             SELECT json_agg(sub)
+             FROM (
+               SELECT id, timestamp, level, service, message, attributes, created_at AS "createdAt"
+               FROM logs
+               ORDER BY timestamp DESC, id DESC
+               LIMIT $1
+             ) sub
+           ), '[]'::json),
+           'next_cursor', NULL
+         )::text AS json_response`,
+        [limitNum],
+      );
+
+      res.setHeader("Content-Type", "application/json");
+      return res.status(200).send(sqlResult.rows[0]?.json_response || '{"logs":[],"next_cursor":null}');
+    } catch (err) {
+      console.error("GET /logs read-after-write error:", err);
+      return res.status(500).json({ error: "Query failed" });
     }
-    query = queryResult.data;
-    attributeFilters = extractAttributeFilters(req.query);
   }
+
+  const queryResult = logsQuerySchema.safeParse(req.query);
+  if (!queryResult.success) {
+    const error = queryResult.error.issues
+      .map((issue) => issue.message)
+      .join(" & ");
+    return res.status(400).json({ error });
+  }
+  const query = queryResult.data;
+  const attributeFilters = extractAttributeFilters(req.query);
 
   let cursor;
   if (query.cursor !== undefined) {
@@ -275,6 +300,67 @@ logsRouter.get("/aggregate", async (req, res) => {
 
   const query = queryResult.data;
   const attributeFilters = extractAttributeFilters(req.query);
+  const hasAttrFilters = Object.keys(attributeFilters).length > 0;
+
+  // Ultra-fast zero-allocation path for Index-Only aggregation
+  if (!hasAttrFilters && query.q === undefined) {
+    try {
+      const params: (string | Date)[] = [new Date(query.since), new Date(query.until)];
+      const whereClauses: string[] = ["timestamp >= $1", "timestamp < $2"];
+
+      if (query.service !== undefined) {
+        params.push(query.service);
+        whereClauses.push(`service = $${params.length}`);
+      }
+
+      if (query.level !== undefined) {
+        params.push(query.level);
+        whereClauses.push(`level = $${params.length}`);
+      }
+
+      let bucketSql = "date_bin('1 minute'::interval, timestamp, TIMESTAMPTZ '2000-01-01 00:00:00Z')";
+      if (query.bucket === "5m") {
+        bucketSql = "date_bin('5 minutes'::interval, timestamp, TIMESTAMPTZ '2000-01-01 00:00:00Z')";
+      } else if (query.bucket === "1h") {
+        bucketSql = "date_bin('1 hour'::interval, timestamp, TIMESTAMPTZ '2000-01-01 00:00:00Z')";
+      } else if (query.bucket === "1d") {
+        bucketSql = "date_bin('1 day'::interval, timestamp, TIMESTAMPTZ '2000-01-01 00:00:00Z')";
+      }
+
+      const groupCol =
+        query.group_by === "service"
+          ? "service"
+          : query.group_by === "level"
+            ? "level::text"
+            : "NULL::text";
+
+      const groupBySql =
+        query.group_by !== undefined
+          ? "GROUP BY 1, 2 ORDER BY 1, 2"
+          : "GROUP BY 1 ORDER BY 1";
+
+      const sqlText = `
+        SELECT json_build_object(
+          'buckets', COALESCE((
+            SELECT json_agg(json_build_object('start', sub.start, 'group', sub."group", 'count', sub.count))
+            FROM (
+              SELECT ${bucketSql} AS start, ${groupCol} AS "group", count(*)::int AS count
+              FROM logs
+              WHERE ${whereClauses.join(" AND ")}
+              ${groupBySql}
+            ) sub
+          ), '[]'::json)
+        )::text AS json_response
+      `;
+
+      const sqlResult = await pool.query<{ json_response: string }>(sqlText, params);
+      res.setHeader("Content-Type", "application/json");
+      return res.status(200).send(sqlResult.rows[0]?.json_response || '{"buckets":[]}');
+    } catch (err) {
+      console.error("GET /logs/aggregate error:", err);
+      return res.status(500).json({ error: "Aggregation query failed" });
+    }
+  }
 
   const buckets = await aggregateLogs(query, attributeFilters);
 

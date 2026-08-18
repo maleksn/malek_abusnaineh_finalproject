@@ -4,6 +4,8 @@ import logsRouter from "./routes/logs.routes";
 import { errorHandler } from "./middleware/errorHandler";
 
 const app = express();
+app.disable("x-powered-by");
+app.disable("etag");
 
 // Middleware
 app.use(express.json({ limit: "1mb" }));

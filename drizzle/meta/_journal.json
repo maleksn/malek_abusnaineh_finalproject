@@ -36,6 +36,13 @@
       "when": 1786946385732,
       "tag": "0004_polite_hydra",
       "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1786946385733,
+      "tag": "0005_optimize_indexes",
+      "breakpoints": true
     }
   ]
 }

@@ -44,10 +44,14 @@ export const logs = pgTable(
       .defaultNow(),
   },
   (table) => [
-    // Primary index for default timestamp sorting and pagination
-    index("logs_timestamp_id_idx").on(table.timestamp.desc(), table.id.desc()),
-    // Range index for lightning-fast aggregate queries
-    index("logs_timestamp_idx").on(table.timestamp.asc()),
+    // Primary index for default timestamp sorting and pagination (supports both forward aggregates and backward scans)
+    index("logs_timestamp_id_idx").on(table.timestamp.asc(), table.id.asc()),
+    // Covering index for lightning-fast aggregate queries (Index-Only Scan on timestamp range + service/level)
+    index("logs_timestamp_service_level_idx").on(
+      table.timestamp.asc(),
+      table.service,
+      table.level,
+    ),
     // Filter by service with timestamp sorting
     index("logs_service_timestamp_id_idx").on(
       table.service,

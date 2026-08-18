@@ -10,61 +10,74 @@ import type { LogCursor } from "../utils/cursor";
 import { from as copyFrom } from "pg-copy-streams";
 import { and, desc, eq, gte, lt, sql } from "drizzle-orm";
 
-// ===================================================
-// Single-Stream Dedicated High-Throughput Ingest Engine
-// ===================================================
-const FLUSH_CHUNK_BATCH = 40; // 40 chunks = 4,000 logs per COPY batch
-const MAX_QUEUE_LOGS = 100000;
+// =========================================================================
+// Dual-Worker Atomic Buffer Swap Ingestion Engine (Zero-OOM, Max Throughput)
+// =========================================================================
+const NUM_WORKERS = 3;
+const workerBusy = [false, false, false];
+let activeBuffer = "";
+let flushResolvers: (() => void)[] = [];
 
-let logQueue: string[] = [];
-let queuedLogsCount = 0;
-let isFlushing = false;
+const FLUSH_THRESHOLD_BYTES = 64 * 1024; // 64KB (~500-800 logs)
+const MAX_BUFFER_BACKPRESSURE_BYTES = 4 * 1024 * 1024; // 4MB backpressure limit
 
 /**
- * Enqueue a pre-serialized CSV chunk directly into in-memory queue
+ * Enqueue a pre-serialized CSV string chunk directly.
+ * Backpressure: If activeBuffer exceeds MAX_BUFFER_BACKPRESSURE_BYTES,
+ * await the ongoing flush before accepting more data to prevent unbounded memory growth.
  */
-export function enqueueCsvChunk(chunk: string, count: number): void {
-  if (queuedLogsCount + count > MAX_QUEUE_LOGS) {
-    throw new Error("Queue capacity exceeded");
+export async function enqueueCsvChunk(chunk: string): Promise<void> {
+  if (activeBuffer.length >= MAX_BUFFER_BACKPRESSURE_BYTES) {
+    await new Promise<void>((resolve) => flushResolvers.push(resolve));
   }
 
-  logQueue.push(chunk);
-  queuedLogsCount += count;
+  activeBuffer += chunk;
+  dispatch();
+}
 
-  if (!isFlushing) {
-    void runFlushLoop();
+function dispatch(): void {
+  for (let i = 0; i < NUM_WORKERS; i++) {
+    if (!workerBusy[i] && activeBuffer.length > 0) {
+      void runWorker(i);
+    }
   }
 }
 
-async function runFlushLoop(): Promise<void> {
-  if (isFlushing) return;
-  isFlushing = true;
+async function runWorker(id: number): Promise<void> {
+  if (workerBusy[id]) return;
+  workerBusy[id] = true;
 
   try {
-    while (logQueue.length > 0) {
-      const batch = logQueue.splice(0, FLUSH_CHUNK_BATCH);
-      const batchPayload = batch.join("");
+    while (activeBuffer.length > 0) {
+      // Synchronously and atomically swap activeBuffer before any async operation
+      const payload = activeBuffer;
+      activeBuffer = "";
 
-      try {
-        await insertCsvPayload(batchPayload);
-      } catch (err) {
-        console.error("Background COPY flush error:", err);
+      // Notify any awaiting requests that buffer has been swapped
+      if (flushResolvers.length > 0) {
+        const resolvers = flushResolvers;
+        flushResolvers = [];
+        for (let r = 0; r < resolvers.length; r++) resolvers[r]!();
       }
 
-      queuedLogsCount = Math.max(0, queuedLogsCount - batch.length * 100);
+      try {
+        await insertCsvPayload(payload);
+      } catch (err) {
+        console.error(`Worker ${id} COPY flush error:`, err);
+      }
     }
   } finally {
-    isFlushing = false;
-    if (logQueue.length > 0) {
-      void runFlushLoop();
+    workerBusy[id] = false;
+    if (activeBuffer.length > 0) {
+      dispatch();
     }
   }
 }
 
-// Periodic timer to flush any lingering logs in the queue
+// 5ms low-latency timer to dispatch any trailing logs in the buffer
 setInterval(() => {
-  if (logQueue.length > 0 && !isFlushing) {
-    void runFlushLoop();
+  if (activeBuffer.length > 0) {
+    dispatch();
   }
 }, 5);
 
@@ -124,6 +137,7 @@ export async function queryLogs(
     cursor === undefined &&
     !hasAttrFilters;
 
+  // Ultra-fast path for read-after-write (GET /logs?limit=20)
   if (isSimpleReadAfterWrite) {
     const res = await pool.query<{
       id: number;
@@ -141,6 +155,55 @@ export async function queryLogs(
       [query.limit + 1],
     );
     return res.rows;
+  }
+
+  // Fast path for service filtered query with cursor or default pagination
+  const isServiceOnly =
+    query.service !== undefined &&
+    query.level === undefined &&
+    query.since === undefined &&
+    query.until === undefined &&
+    query.q === undefined &&
+    !hasAttrFilters;
+
+  if (isServiceOnly) {
+    if (cursor !== undefined) {
+      const res = await pool.query<{
+        id: number;
+        timestamp: Date;
+        level: "debug" | "info" | "warn" | "error";
+        service: string;
+        message: string;
+        attributes: Record<string, unknown>;
+        createdAt: Date;
+      }>(
+        `SELECT id, timestamp, level, service, message, attributes, created_at AS "createdAt"
+         FROM logs
+         WHERE service = $1 AND (timestamp, id) < ($2, $3)
+         ORDER BY service, timestamp DESC, id DESC
+         LIMIT $4`,
+        [query.service, new Date(cursor.timestamp), cursor.id, query.limit + 1],
+      );
+      return res.rows;
+    } else {
+      const res = await pool.query<{
+        id: number;
+        timestamp: Date;
+        level: "debug" | "info" | "warn" | "error";
+        service: string;
+        message: string;
+        attributes: Record<string, unknown>;
+        createdAt: Date;
+      }>(
+        `SELECT id, timestamp, level, service, message, attributes, created_at AS "createdAt"
+         FROM logs
+         WHERE service = $1
+         ORDER BY service, timestamp DESC, id DESC
+         LIMIT $2`,
+        [query.service, query.limit + 1],
+      );
+      return res.rows;
+    }
   }
 
   const conditions = [];
@@ -168,7 +231,6 @@ export async function queryLogs(
 
   if (cursor !== undefined) {
     const cursorTimestamp = new Date(cursor.timestamp);
-    // Optimized single-pass tuple comparison for B-tree index
     conditions.push(
       sql`(${logsTable.timestamp}, ${logsTable.id}) < (${cursorTimestamp}, ${cursor.id})`,
     );
@@ -176,14 +238,15 @@ export async function queryLogs(
   for (const [key, value] of Object.entries(attributeFilters)) {
     conditions.push(sql`${logsTable.attributes} @> ${JSON.stringify({ [key]: value })}::jsonb`);
   }
+
   // Optimizer fence for GIN queries (q and attributes) to prevent slow backward heap scans
-  const hasGinFilter = query.q !== undefined || Object.keys(attributeFilters).length > 0;
+  const hasGinFilter = query.q !== undefined || hasAttrFilters;
   if (hasGinFilter) {
     const subquery = db
       .select()
       .from(logsTable)
       .where(and(...conditions))
-      .offset(0) // Forces Postgres optimizer NOT to flatten the subquery
+      .offset(0)
       .as("filtered_logs");
     return db
       .select()
@@ -200,19 +263,6 @@ export async function queryLogs(
     .limit(query.limit + 1);
 }
 
-function getBucketExpression(bucket: AggregateQuery["bucket"]) {
-  switch (bucket) {
-    case "1m":
-      return sql<Date>`date_trunc('minute', ${logsTable.timestamp})`;
-    case "5m":
-      return sql<Date>`to_timestamp(floor(extract(epoch from ${logsTable.timestamp}) / 300) * 300)`;
-    case "1h":
-      return sql<Date>`date_trunc('hour', ${logsTable.timestamp})`;
-    case "1d":
-      return sql<Date>`date_trunc('day', ${logsTable.timestamp})`;
-  }
-}
-
 export interface AggregateBucketResult {
   start: Date | string;
   group: string | null;
@@ -224,8 +274,8 @@ export async function aggregateLogs(
   attributeFilters: Record<string, string>,
 ): Promise<AggregateBucketResult[]> {
   const hasAttrFilters = Object.keys(attributeFilters).length > 0;
-  
-  // Fast path for standard bucket aggregate queries using direct pg pool query
+
+  // Pure Index-Only Scan path on logs_timestamp_service_level_idx
   if (!hasAttrFilters && query.q === undefined) {
     const params: (string | Date)[] = [new Date(query.since), new Date(query.until)];
     const whereClauses: string[] = ["timestamp >= $1", "timestamp < $2"];
@@ -240,17 +290,26 @@ export async function aggregateLogs(
       whereClauses.push(`level = $${params.length}`);
     }
 
-    let bucketSql = "date_trunc('minute', timestamp)";
+    let bucketSql = "date_bin('1 minute'::interval, timestamp, TIMESTAMPTZ '2000-01-01 00:00:00Z')";
     if (query.bucket === "5m") {
-      bucketSql = "to_timestamp(floor(extract(epoch from timestamp) / 300) * 300)";
+      bucketSql = "date_bin('5 minutes'::interval, timestamp, TIMESTAMPTZ '2000-01-01 00:00:00Z')";
     } else if (query.bucket === "1h") {
-      bucketSql = "date_trunc('hour', timestamp)";
+      bucketSql = "date_bin('1 hour'::interval, timestamp, TIMESTAMPTZ '2000-01-01 00:00:00Z')";
     } else if (query.bucket === "1d") {
-      bucketSql = "date_trunc('day', timestamp)";
+      bucketSql = "date_bin('1 day'::interval, timestamp, TIMESTAMPTZ '2000-01-01 00:00:00Z')";
     }
 
-    const groupCol = query.group_by === "service" ? "service" : query.group_by === "level" ? "level" : "NULL::text";
-    const groupBySql = query.group_by !== undefined ? "GROUP BY 1, 2 ORDER BY 1" : "GROUP BY 1 ORDER BY 1";
+    const groupCol =
+      query.group_by === "service"
+        ? "service"
+        : query.group_by === "level"
+          ? "level::text"
+          : "NULL::text";
+
+    const groupBySql =
+      query.group_by !== undefined
+        ? "GROUP BY 1, 2 ORDER BY 1, 2"
+        : "GROUP BY 1 ORDER BY 1";
 
     const sqlText = `
       SELECT ${bucketSql} AS start, ${groupCol} AS "group", count(*)::int AS count
@@ -259,12 +318,24 @@ export async function aggregateLogs(
       ${groupBySql}
     `;
 
-    const res = await pool.query<{ start: Date | string; group: string | null; count: number }>(sqlText, params);
+    const res = await pool.query<{ start: Date | string; group: string | null; count: number }>(
+      sqlText,
+      params,
+    );
     return res.rows;
   }
 
-  const bucketExpression = getBucketExpression(query.bucket);
-  const groupExpression =
+  // Fallback for complex queries with q or attributes
+  let bucketSql = "date_bin('1 minute'::interval, timestamp, TIMESTAMPTZ '2000-01-01 00:00:00Z')";
+  if (query.bucket === "5m") {
+    bucketSql = "date_bin('5 minutes'::interval, timestamp, TIMESTAMPTZ '2000-01-01 00:00:00Z')";
+  } else if (query.bucket === "1h") {
+    bucketSql = "date_bin('1 hour'::interval, timestamp, TIMESTAMPTZ '2000-01-01 00:00:00Z')";
+  } else if (query.bucket === "1d") {
+    bucketSql = "date_bin('1 day'::interval, timestamp, TIMESTAMPTZ '2000-01-01 00:00:00Z')";
+  }
+
+  const groupCol =
     query.group_by === "service"
       ? logsTable.service
       : query.group_by === "level"
@@ -297,8 +368,8 @@ export async function aggregateLogs(
 
   const result = await db
     .select({
-      start: bucketExpression,
-      group: groupExpression,
+      start: sql<Date>`${sql.raw(bucketSql)}`,
+      group: groupCol,
       count: sql<number>`count(*)::int`,
     })
     .from(logsTable)
@@ -308,8 +379,9 @@ export async function aggregateLogs(
 
   return result.map((row) => ({
     start: row.start,
-    group: row.group,
+    group: row.group as string | null,
     count: row.count,
   }));
 }
+
 

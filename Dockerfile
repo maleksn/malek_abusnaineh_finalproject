@@ -12,4 +12,4 @@ COPY drizzle ./drizzle
 
 RUN npm run build
 
-CMD ["node", "--max-old-space-size=210", "dist/server.cjs"]
+CMD ["node", "--max-old-space-size=210", "--expose-gc", "dist/server.cjs"]

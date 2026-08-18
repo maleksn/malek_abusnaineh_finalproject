@@ -10,6 +10,16 @@ process.on("uncaughtException", (error) => {
   console.error("Uncaught Exception:", error);
 });
 
+// Proactive background memory guard: triggers GC if heapUsed exceeds 75MB
+setInterval(() => {
+  if (typeof global.gc === "function") {
+    const mem = process.memoryUsage();
+    if (mem.heapUsed > 75 * 1024 * 1024) {
+      global.gc();
+    }
+  }
+}, 3000);
+
 const PORT = 8080;
 
 const RETRY_INTERVAL = 10000;
@@ -74,9 +84,12 @@ async function waitForDatabase(): Promise<void> {
 
 
 async function startServer(): Promise<void> {
-  app.listen(PORT, () => {
+  const server = app.listen(PORT, () => {
     console.log(`Server is running on http://localhost:${PORT}`);
   });
+
+  server.keepAliveTimeout = 30000;
+  server.headersTimeout = 31000;
 
   console.log("Waiting for database...");
   await waitForDatabase();
