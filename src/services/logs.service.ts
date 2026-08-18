@@ -9,6 +9,7 @@ import type { LogCursor } from "../utils/cursor";
 
 import { from as copyFrom } from "pg-copy-streams";
 import { and, desc, eq, gte, lt, sql } from "drizzle-orm";
+import { createHash } from "node:crypto";
 
 // =========================================================================
 // Dual-Worker Atomic Buffer Swap Ingestion Engine (Zero-OOM, Max Throughput)
@@ -218,6 +219,8 @@ export async function queryLogs(
       LIMIT ${limitParam}
     `;
 
+  const queryName = "q_logs_" + createHash("md5").update(sqlText).digest("hex").slice(0, 16);
+
   const res = await readPool.query<{
     id: number;
     timestamp: Date;
@@ -226,7 +229,11 @@ export async function queryLogs(
     message: string;
     attributes: Record<string, unknown>;
     createdAt: Date;
-  }>(sqlText, params);
+  }>({
+    name: queryName,
+    text: sqlText,
+    values: params,
+  });
 
   return res.rows;
 }
@@ -286,10 +293,13 @@ export async function aggregateLogs(
       ${groupBySql}
     `;
 
-    const res = await readPool.query<{ start: Date | string; group: string | null; count: number }>(
-      sqlText,
-      params,
-    );
+    const queryName = `agg_fast_${query.bucket}_${query.group_by || "none"}_${query.service !== undefined ? "s" : "_"}_${query.level !== undefined ? "l" : "_"}`;
+
+    const res = await readPool.query<{ start: Date | string; group: string | null; count: number }>({
+      name: queryName,
+      text: sqlText,
+      values: params,
+    });
     return res.rows;
   }
 

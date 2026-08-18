@@ -14,6 +14,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    logging:
+      driver: "none"
     deploy:
       resources:
         limits:
@@ -22,26 +24,25 @@ services:
 
   postgres:
     image: postgres:16-alpine
-    shm_size: 256mb
+    shm_size: 64mb
     command: >
-      postgres -c synchronous_commit=off -c shared_buffers=256MB -c wal_buffers=32MB -c work_mem=64MB -c maintenance_work_mem=64MB -c checkpoint_completion_target=0.9 -c checkpoint_timeout=30min -c min_wal_size=512MB -c max_wal_size=4GB -c max_connections=60 -c random_page_cost=1.1 -c seq_page_cost=1.0 -c effective_cache_size=768MB -c gin_pending_list_limit=64MB -c max_parallel_workers_per_gather=0 -c max_parallel_workers=0 -c autovacuum_vacuum_scale_factor=0.05 -c autovacuum_vacuum_cost_limit=1000 -c autovacuum_vacuum_cost_delay=2ms -c bgwriter_delay=20ms -c bgwriter_lru_maxpages=800 -c bgwriter_lru_multiplier=4.0
+      postgres -c jit=off -c synchronous_commit=off -c shared_buffers=256MB -c wal_buffers=16MB -c work_mem=16MB -c maintenance_work_mem=32MB -c checkpoint_completion_target=0.9 -c checkpoint_timeout=30min -c min_wal_size=32MB -c max_wal_size=256MB -c max_connections=60 -c random_page_cost=1.1 -c seq_page_cost=1.0 -c effective_cache_size=512MB -c gin_pending_list_limit=32MB -c max_parallel_workers_per_gather=0 -c max_parallel_workers=0 -c autovacuum_vacuum_scale_factor=0.05 -c autovacuum_vacuum_cost_limit=1000 -c autovacuum_vacuum_cost_delay=2ms -c bgwriter_delay=20ms -c bgwriter_lru_maxpages=800 -c bgwriter_lru_multiplier=4.0
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: logs
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
+    tmpfs:
+      - /var/lib/postgresql/data:rw,noexec,nosuid,size=600m
     healthcheck:
       test: [ "CMD-SHELL", "pg_isready -U postgres -d logs" ]
       interval: 2s
       timeout: 3s
       retries: 20
       start_period: 10s
+    logging:
+      driver: "none"
     deploy:
       resources:
         limits:
           cpus: "1.0"
           memory: 1G
-
-volumes:
-  postgres_data:

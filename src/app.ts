@@ -6,6 +6,7 @@ import { errorHandler } from "./middleware/errorHandler";
 const app = express();
 app.disable("x-powered-by");
 app.disable("etag");
+app.set("query parser", "simple");
 
 // Middleware
 app.use(express.json({ limit: "1mb" }));

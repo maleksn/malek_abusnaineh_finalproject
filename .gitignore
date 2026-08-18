@@ -13,6 +13,7 @@ build/
 # Benchmark & Profiler outputs / Test scripts
 scripts/
 profiler-output/
+benchmark-report.html
 
 # Logs
 *.log

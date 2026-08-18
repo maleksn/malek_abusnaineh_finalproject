@@ -33,6 +33,11 @@ function isValidIsoTimestamp(ts: string): boolean {
   return true;
 }
 
+let cachedMaxFutureIso = new Date(Date.now() + 300000).toISOString();
+setInterval(() => {
+  cachedMaxFutureIso = new Date(Date.now() + 300000).toISOString();
+}, 1000);
+
 const logsRouter = Router();
 
 logsRouter.post("/", async (req, res) => {
@@ -49,7 +54,7 @@ logsRouter.post("/", async (req, res) => {
   const lines: string[] = new Array(len);
   let acceptedCount = 0;
   let rejected: RejectedLog[] | null = null;
-  const maxFutureIso = new Date(Date.now() + 300000).toISOString();
+  const maxFutureIso = cachedMaxFutureIso;
 
   for (let index = 0; index < len; index++) {
     const log = logs[index];
@@ -246,9 +251,9 @@ logsRouter.get("/", async (req, res) => {
     hasMore && lastLog
       ? encodeCursor({
         timestamp:
-          lastLog.timestamp instanceof Date
-            ? lastLog.timestamp.toISOString()
-            : new Date(String(lastLog.timestamp)).toISOString(),
+          typeof lastLog.timestamp === "string"
+            ? lastLog.timestamp
+            : (lastLog.timestamp instanceof Date ? lastLog.timestamp.toISOString() : String(lastLog.timestamp)),
         id: Number(lastLog.id),
       })
       : null;
@@ -320,18 +325,24 @@ logsRouter.get("/aggregate", async (req, res) => {
         ${groupBySql}
       `;
 
+      const queryName = `agg_fast_${query.bucket}_${query.group_by || "none"}_${query.service !== undefined ? "s" : "_"}_${query.level !== undefined ? "l" : "_"}`;
+
       const sqlResult = await readPool.query<{
         start: Date | string;
         group: string | null;
         count: number;
-      }>(sqlText, params);
+      }>({
+        name: queryName,
+        text: sqlText,
+        values: params,
+      });
 
       return res.status(200).json({
         buckets: sqlResult.rows.map((row) => ({
           start:
-            row.start instanceof Date
-              ? row.start.toISOString()
-              : new Date(String(row.start)).toISOString(),
+            typeof row.start === "string"
+              ? row.start
+              : (row.start instanceof Date ? row.start.toISOString() : String(row.start)),
           group: row.group,
           count: row.count,
         })),
@@ -347,9 +358,9 @@ logsRouter.get("/aggregate", async (req, res) => {
   return res.status(200).json({
     buckets: buckets.map((bucket) => ({
       start:
-        bucket.start instanceof Date
-          ? bucket.start.toISOString()
-          : new Date(String(bucket.start)).toISOString(),
+        typeof bucket.start === "string"
+          ? bucket.start
+          : (bucket.start instanceof Date ? bucket.start.toISOString() : String(bucket.start)),
       group: bucket.group,
       count: bucket.count,
     })),
