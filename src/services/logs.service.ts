@@ -99,15 +99,6 @@ async function runWorker(id: number): Promise<void> {
   }
 }
 
-export const TRAILING_FLUSH_MS = 50;
-
-// 50ms trailing timer to dispatch any trailing logs in the buffer without event loop thrashing
-setInterval(() => {
-  if (activeBuffer.length > 0) {
-    dispatch();
-  }
-}, TRAILING_FLUSH_MS);
-
 /**
  * High-speed bulk insertion using PostgreSQL COPY stream
  */
@@ -361,5 +352,3 @@ export async function aggregateLogs(
     count: row.count,
   }));
 }
-
-
