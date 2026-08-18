@@ -204,7 +204,6 @@ logsRouter.post("/", async (req, res) => {
   const validCsvChunk = lines.join("\n") + "\n";
 
   await enqueueCsvChunk(validCsvChunk);
-  await flushCurrentBuffer();
 
   if (!rejected || rejected.length === 0) {
     res.setHeader("Content-Type", "application/json");

@@ -12,10 +12,16 @@ import { createHash } from "node:crypto";
 // =========================================================================
 // Dual-Worker Atomic Buffer Swap Ingestion Engine (Zero-OOM, Max Throughput)
 // =========================================================================
+type BatchResolver = {
+  resolve: () => void;
+  reject: (err: Error) => void;
+};
+
 const NUM_WORKERS = 3;
 const workerBusy = [false, false, false];
 let activeBuffer = "";
-let flushResolvers: (() => void)[] = [];
+let pendingResolvers: BatchResolver[] = [];
+let backpressureResolvers: (() => void)[] = [];
 let activeWorkerPromises: Promise<void>[] = [];
 const FLUSH_THRESHOLD_BYTES = 64 * 1024; // 64KB (~500 logs)
 const MAX_BUFFER_BACKPRESSURE_BYTES = 128 * 1024; // 128KB backpressure limit (~1,000 logs max)
@@ -28,27 +34,50 @@ export async function flushCurrentBuffer(): Promise<void> {
   while (activeBuffer.length > 0 || activeWorkerPromises.length > 0) {
     if (activeBuffer.length > 0) dispatch();
     if (activeWorkerPromises.length > 0) {
-      await Promise.all([...activeWorkerPromises]);
+      await Promise.allSettled([...activeWorkerPromises]);
     }
     // Yield to event loop to allow worker 'finally' blocks to execute and update the promises array
     await new Promise((resolve) => setImmediate(resolve));
   }
 }
 
-/**
- * Enqueue a pre-serialized CSV string chunk directly.
- * Backpressure: If activeBuffer exceeds MAX_BUFFER_BACKPRESSURE_BYTES,
- * await the ongoing flush before accepting more data to prevent unbounded memory growth.
- */
-export async function enqueueCsvChunk(chunk: string): Promise<void> {
-  if (activeBuffer.length >= MAX_BUFFER_BACKPRESSURE_BYTES) {
-    await new Promise<void>((resolve) => flushResolvers.push(resolve));
-  }
+let dispatchScheduled = false;
 
-  activeBuffer += chunk;
+function scheduleDispatch(): void {
   if (activeBuffer.length >= FLUSH_THRESHOLD_BYTES) {
     dispatch();
+    return;
   }
+  if (!dispatchScheduled) {
+    dispatchScheduled = true;
+    queueMicrotask(() => {
+      dispatchScheduled = false;
+      dispatch();
+    });
+  }
+}
+
+/**
+ * Enqueue a pre-serialized CSV string chunk directly.
+ * Returns a Promise that resolves when the chunk is durably committed to PostgreSQL,
+ * or rejects if database insertion fails (guaranteeing FR-09 durability).
+ *
+ * Backpressure: If activeBuffer exceeds MAX_BUFFER_BACKPRESSURE_BYTES,
+ * await ongoing buffer swap before accepting more data to prevent unbounded memory growth.
+ */
+export async function enqueueCsvChunk(chunk: string): Promise<void> {
+  if (!chunk) return;
+
+  if (activeBuffer.length >= MAX_BUFFER_BACKPRESSURE_BYTES) {
+    await new Promise<void>((resolve) => backpressureResolvers.push(resolve));
+  }
+
+  return new Promise<void>((resolve, reject) => {
+    activeBuffer += chunk;
+    pendingResolvers.push({ resolve, reject });
+
+    scheduleDispatch();
+  });
 }
 
 function dispatch(): void {
@@ -65,28 +94,41 @@ async function runWorker(id: number): Promise<void> {
 
   try {
     while (activeBuffer.length > 0) {
-      // Synchronously and atomically swap activeBuffer before any async operation
+      // Synchronously and atomically swap activeBuffer and pendingResolvers
       const payload = activeBuffer;
+      const resolvers = pendingResolvers;
       activeBuffer = "";
+      pendingResolvers = [];
 
-      // Notify any awaiting requests that buffer has been swapped
-      if (flushResolvers.length > 0) {
-        const resolvers = flushResolvers;
-        flushResolvers = [];
-        for (let r = 0; r < resolvers.length; r++) resolvers[r]!();
+      // Notify any awaiting backpressure requests that buffer has been swapped
+      if (backpressureResolvers.length > 0) {
+        const bpResolvers = backpressureResolvers;
+        backpressureResolvers = [];
+        for (let r = 0; r < bpResolvers.length; r++) {
+          bpResolvers[r]!();
+        }
       }
 
       const flushPromise = insertCsvPayload(payload);
       activeWorkerPromises.push(flushPromise);
-      flushPromise.finally(() => {
-        const idx = activeWorkerPromises.indexOf(flushPromise);
-        if (idx !== -1) activeWorkerPromises.splice(idx, 1);
-      });
 
       try {
         await flushPromise;
+
+        // Durable commit successful: resolve all callers for this batch
+        for (let r = 0; r < resolvers.length; r++) {
+          resolvers[r]!.resolve();
+        }
       } catch (err) {
-        console.error(`Worker ${id} COPY flush error:`, err);
+        const error = err instanceof Error ? err : new Error(String(err));
+        console.error(`Worker ${id} COPY flush error:`, error.message);
+        // Insertion failed: reject all callers for this batch to prevent silent data loss (FR-09)
+        for (let r = 0; r < resolvers.length; r++) {
+          resolvers[r]!.reject(error);
+        }
+      } finally {
+        const idx = activeWorkerPromises.indexOf(flushPromise);
+        if (idx !== -1) activeWorkerPromises.splice(idx, 1);
       }
     }
   } finally {
@@ -98,17 +140,13 @@ async function runWorker(id: number): Promise<void> {
 }
 
 /**
- * High-speed bulk insertion using PostgreSQL COPY stream
+ * High-speed bulk insertion using PostgreSQL COPY stream.
+ * Propagates all errors to caller and ensures proper client cleanup on error.
  */
 async function insertCsvPayload(payload: string): Promise<void> {
   if (!payload) return;
-  let client;
-  try {
-    client = await pool.connect();
-  } catch (err) {
-    console.error("Failed to connect to database for COPY:", err);
-    return;
-  }
+  const client = await pool.connect();
+  let streamError: Error | null = null;
 
   try {
     const copyStream = client.query(
@@ -128,11 +166,10 @@ async function insertCsvPayload(payload: string): Promise<void> {
 
     await client.query("SELECT 1");
   } catch (err) {
-    console.error("COPY stream error:", err);
+    streamError = err instanceof Error ? err : new Error(String(err));
+    throw streamError;
   } finally {
-    if (client) {
-      client.release();
-    }
+    client.release(streamError || undefined);
   }
 }
 

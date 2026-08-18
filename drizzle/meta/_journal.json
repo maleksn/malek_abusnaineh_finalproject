@@ -5,50 +5,8 @@
     {
       "idx": 0,
       "version": "7",
-      "when": 1785538234942,
-      "tag": "0000_smooth_ben_grimm",
-      "breakpoints": true
-    },
-    {
-      "idx": 1,
-      "version": "7",
-      "when": 1786489384190,
-      "tag": "0001_sticky_whizzer",
-      "breakpoints": true
-    },
-    {
-      "idx": 2,
-      "version": "7",
-      "when": 1786832330501,
-      "tag": "0002_sharp_blindfold",
-      "breakpoints": true
-    },
-    {
-      "idx": 3,
-      "version": "7",
-      "when": 1786832330502,
-      "tag": "0003_add_message_trgm",
-      "breakpoints": true
-    },
-    {
-      "idx": 4,
-      "version": "7",
-      "when": 1786946385732,
-      "tag": "0004_polite_hydra",
-      "breakpoints": true
-    },
-    {
-      "idx": 5,
-      "version": "7",
-      "when": 1786946385733,
-      "tag": "0005_optimize_indexes",
-      "breakpoints": true
-    },
-    {
-      "idx": 6,
-      "version": "7",
-      "when": 1786946385734,
-      "tag": "0006_consolidate_indexes",
+      "when": 1787095777949,
+      "tag": "0000_init",
       "breakpoints": true
     }
   ]

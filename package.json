@@ -6,6 +6,7 @@
     "dev": "tsx watch src/server.ts",
     "build": "tsc --noEmit && esbuild src/server.ts --bundle --platform=node --target=node22 --format=cjs --outfile=dist/server.cjs",
     "start": "node dist/server.cjs",
+    "test": "tsx scripts/smoke-test.ts",
     "load-test": "tsx scripts/load-test.ts",
     "benchmark": "node ./node_modules/@foothill/logs-benchmark/dist/index.js --compose ./docker-compose.yml --seed 6122026 --runner docker --generator-cpus 4",
     "benchmark:full": "node ./node_modules/@foothill/logs-benchmark/dist/index.js --compose ./docker-compose.yml --full --seed 6122026 --runner docker --generator-cpus 4",

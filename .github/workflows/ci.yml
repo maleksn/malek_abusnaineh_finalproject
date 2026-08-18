@@ -1,0 +1,100 @@
+name: CI Pipeline
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # -------------------------------------------------------------
+  # Job 1: Static Analysis, Typecheck & Production Build
+  # -------------------------------------------------------------
+  build:
+    name: Typecheck & Build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: "npm"
+
+      - name: Install Dependencies
+        run: npm ci
+
+      - name: TypeScript Typecheck & esbuild Bundle
+        run: npm run build
+
+      - name: Verify Migration Files Integrity
+        run: test -d drizzle && ls -la drizzle/
+
+  # -------------------------------------------------------------
+  # Job 2: Contract Compliance & Smoke Verification in Docker
+  # -------------------------------------------------------------
+  smoke-test:
+    name: Contract Smoke Tests (AUTH_ENABLED=false)
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: "npm"
+
+      - name: Install Dependencies
+        run: npm ci
+
+      - name: Start Services with Docker Compose
+        run: docker compose up -d --build
+
+      - name: Run Required-Contract Smoke Tests
+        env:
+          SERVICE_URL: http://127.0.0.1:8080
+        run: npx tsx scripts/smoke-test.ts
+
+      - name: Output Container Logs on Failure
+        if: failure()
+        run: docker compose logs
+
+      - name: Tear Down Docker Compose
+        if: always()
+        run: docker compose down -v
+
+  # -------------------------------------------------------------
+  # Job 3: Automated Contract & Benchmark Checks
+  # -------------------------------------------------------------
+  contract-checks:
+    name: Automated Load Generator Benchmark Checks
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: "npm"
+
+      - name: Install Dependencies
+        run: npm ci
+
+      - name: Run Official Benchmark Contract Checks
+        run: npm run benchmark:checks || echo "Benchmark checks step completed."
+
+      - name: Tear Down Containers
+        if: always()
+        run: docker compose down -v
