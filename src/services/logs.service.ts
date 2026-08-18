@@ -3,12 +3,10 @@ import type {
   LogsQuery,
   AggregateQuery,
 } from "../validators/logs.validator";
-import { db, pool, readPool } from "../db";
-import { logs as logsTable } from "../db/schema";
+import { pool, readPool } from "../db";
 import type { LogCursor } from "../utils/cursor";
 
 import { from as copyFrom } from "pg-copy-streams";
-import { and, desc, eq, gte, lt, sql } from "drizzle-orm";
 import { createHash } from "node:crypto";
 
 // =========================================================================
@@ -191,9 +189,9 @@ export async function queryLogs(
   // Use optimizer fence (OFFSET 0) for GIN-filtered queries to force GIN index usage instead of backward B-Tree scan
   const sqlText = hasGinFilter
     ? `
-      SELECT id, timestamp, level, service, message, attributes, created_at AS "createdAt"
+      SELECT id, timestamp, level, service, message, attributes
       FROM (
-        SELECT id, timestamp, level, service, message, attributes, created_at
+        SELECT id, timestamp, level, service, message, attributes
         FROM logs
         ${whereSql}
         ORDER BY timestamp DESC, id DESC
@@ -203,7 +201,7 @@ export async function queryLogs(
       LIMIT ${limitParam}
     `
     : `
-      SELECT id, timestamp, level, service, message, attributes, created_at AS "createdAt"
+      SELECT id, timestamp, level, service, message, attributes
       FROM logs
       ${whereSql}
       ORDER BY timestamp DESC, id DESC
@@ -213,20 +211,29 @@ export async function queryLogs(
   const queryName = "q_logs_" + createHash("md5").update(sqlText).digest("hex").slice(0, 16);
 
   const res = await readPool.query<{
-    id: number;
-    timestamp: Date;
+    id: number | string;
+    timestamp: Date | string;
     level: "debug" | "info" | "warn" | "error";
     service: string;
     message: string;
     attributes: Record<string, unknown>;
-    createdAt: Date;
   }>({
     name: queryName,
     text: sqlText,
     values: params,
   });
 
-  return res.rows;
+  return res.rows.map((row) => ({
+    id: String(row.id),
+    timestamp:
+      typeof row.timestamp === "string"
+        ? row.timestamp
+        : (row.timestamp instanceof Date ? row.timestamp.toISOString() : String(row.timestamp)),
+    level: row.level,
+    service: row.service,
+    message: row.message,
+    attributes: row.attributes ?? {},
+  }));
 }
 
 export interface AggregateBucketResult {
@@ -304,51 +311,53 @@ export async function aggregateLogs(
     bucketSql = "date_bin('1 day'::interval, timestamp, TIMESTAMPTZ '2000-01-01 00:00:00Z')";
   }
 
-  const groupCol =
-    query.group_by === "service"
-      ? logsTable.service
-      : query.group_by === "level"
-        ? logsTable.level
-        : sql<null>`NULL`;
-
-  const conditions = [
-    gte(logsTable.timestamp, new Date(query.since)),
-    lt(logsTable.timestamp, new Date(query.until)),
-  ];
+  const params: (string | Date)[] = [new Date(query.since), new Date(query.until)];
+  const whereClauses: string[] = ["timestamp >= $1", "timestamp < $2"];
 
   if (query.service !== undefined) {
-    conditions.push(eq(logsTable.service, query.service));
+    params.push(query.service);
+    whereClauses.push(`service = $${params.length}`);
   }
+
   if (query.level !== undefined) {
-    conditions.push(eq(logsTable.level, query.level));
+    params.push(query.level);
+    whereClauses.push(`level = $${params.length}`);
   }
+
   if (query.q !== undefined) {
-    const term = `%${query.q}%`;
-    conditions.push(sql`${logsTable.message} ILIKE ${term}`);
+    params.push(`%${query.q}%`);
+    whereClauses.push(`message ILIKE $${params.length}`);
   }
+
   for (const [key, value] of Object.entries(attributeFilters)) {
-    conditions.push(sql`${logsTable.attributes}->>${key} = ${value}`);
+    const safeKey = key.replace(/'/g, "''");
+    params.push(value);
+    whereClauses.push(`attributes->>'${safeKey}' = $${params.length}`);
   }
 
-  const groupByClause =
+  const groupCol =
+    query.group_by === "service"
+      ? "service"
+      : query.group_by === "level"
+        ? "level::text"
+        : "NULL::text";
+
+  const groupBySql =
     query.group_by !== undefined
-      ? [sql.raw("1"), sql.raw("2")]
-      : [sql.raw("1")];
+      ? "GROUP BY 1, 2 ORDER BY 1, 2"
+      : "GROUP BY 1 ORDER BY 1";
 
-  const result = await db
-    .select({
-      start: sql<Date>`${sql.raw(bucketSql)}`,
-      group: groupCol,
-      count: sql<number>`count(*)::int`,
-    })
-    .from(logsTable)
-    .where(and(...conditions))
-    .groupBy(...groupByClause)
-    .orderBy(sql.raw("1"));
+  const sqlText = `
+    SELECT ${bucketSql} AS start, ${groupCol} AS "group", count(*)::int AS count
+    FROM logs
+    WHERE ${whereClauses.join(" AND ")}
+    ${groupBySql}
+  `;
 
-  return result.map((row) => ({
-    start: row.start,
-    group: row.group as string | null,
-    count: row.count,
-  }));
+  const res = await readPool.query<{ start: Date | string; group: string | null; count: number }>({
+    text: sqlText,
+    values: params,
+  });
+
+  return res.rows;
 }

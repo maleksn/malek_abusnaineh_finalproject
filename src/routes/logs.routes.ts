@@ -25,17 +25,17 @@ type RejectedLog = {
 
 function isValidIsoTimestamp(ts: string): boolean {
   const len = ts.length;
-  if (len < 20 || len > 30) return false;
-  if (ts.charCodeAt(len - 1) !== 90) return false; // 'Z'
+  if (len < 19 || len > 35) return false;
   if (ts.charCodeAt(4) !== 45 || ts.charCodeAt(7) !== 45) return false; // '-'
   if (ts.charCodeAt(10) !== 84) return false; // 'T'
   if (ts.charCodeAt(13) !== 58 || ts.charCodeAt(16) !== 58) return false; // ':'
-  return true;
+  const parsed = Date.parse(ts);
+  return !Number.isNaN(parsed);
 }
 
-let cachedMaxFutureIso = new Date(Date.now() + 300000).toISOString();
+let cachedMaxFutureMs = Date.now() + 300000;
 setInterval(() => {
-  cachedMaxFutureIso = new Date(Date.now() + 300000).toISOString();
+  cachedMaxFutureMs = Date.now() + 300000;
 }, 1000);
 
 const logsRouter = Router();
@@ -54,7 +54,7 @@ logsRouter.post("/", async (req, res) => {
   const lines: string[] = new Array(len);
   let acceptedCount = 0;
   let rejected: RejectedLog[] | null = null;
-  const maxFutureIso = cachedMaxFutureIso;
+  const maxFutureMs = cachedMaxFutureMs;
 
   for (let index = 0; index < len; index++) {
     const log = logs[index];
@@ -81,7 +81,8 @@ logsRouter.post("/", async (req, res) => {
       continue;
     }
 
-    if (ts > maxFutureIso) {
+    const parsedMs = Date.parse(ts);
+    if (parsedMs > maxFutureMs) {
       if (!rejected) rejected = [];
       rejected.push({
         index,
@@ -251,10 +252,7 @@ logsRouter.get("/", async (req, res) => {
   const nextCursor =
     hasMore && lastLog
       ? encodeCursor({
-        timestamp:
-          typeof lastLog.timestamp === "string"
-            ? lastLog.timestamp
-            : (lastLog.timestamp instanceof Date ? lastLog.timestamp.toISOString() : String(lastLog.timestamp)),
+        timestamp: lastLog.timestamp,
         id: Number(lastLog.id),
       })
       : null;
@@ -266,6 +264,9 @@ logsRouter.get("/", async (req, res) => {
 });
 
 logsRouter.get("/aggregate", async (req, res) => {
+  // Ensure any in-flight buffer is flushed for 100% read-after-write consistency
+  await flushCurrentBuffer();
+
   const queryResult = aggregateQuerySchema.safeParse(req.query);
 
   if (!queryResult.success) {
