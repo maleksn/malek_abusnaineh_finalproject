@@ -3,7 +3,7 @@ import type {
   LogsQuery,
   AggregateQuery,
 } from "../validators/logs.validator";
-import { db, pool } from "../db";
+import { db, pool, readPool } from "../db";
 import { logs as logsTable } from "../db/schema";
 import type { LogCursor } from "../utils/cursor";
 
@@ -17,9 +17,24 @@ const NUM_WORKERS = 3;
 const workerBusy = [false, false, false];
 let activeBuffer = "";
 let flushResolvers: (() => void)[] = [];
+let activeWorkerPromises: Promise<void>[] = [];
+const FLUSH_THRESHOLD_BYTES = 64 * 1024; // 64KB (~500 logs)
+const MAX_BUFFER_BACKPRESSURE_BYTES = 128 * 1024; // 128KB backpressure limit (~1,000 logs max)
 
-const FLUSH_THRESHOLD_BYTES = 64 * 1024; // 64KB (~500-800 logs)
-const MAX_BUFFER_BACKPRESSURE_BYTES = 4 * 1024 * 1024; // 4MB backpressure limit
+/**
+ * Instant consistency barrier for read-after-write queries.
+ * Flushes any pending logs in activeBuffer and awaits all in-flight worker commits.
+ */
+export async function flushCurrentBuffer(): Promise<void> {
+  while (activeBuffer.length > 0 || activeWorkerPromises.length > 0) {
+    if (activeBuffer.length > 0) dispatch();
+    if (activeWorkerPromises.length > 0) {
+      await Promise.all([...activeWorkerPromises]);
+    }
+    // Yield to event loop to allow worker 'finally' blocks to execute and update the promises array
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+}
 
 /**
  * Enqueue a pre-serialized CSV string chunk directly.
@@ -32,7 +47,9 @@ export async function enqueueCsvChunk(chunk: string): Promise<void> {
   }
 
   activeBuffer += chunk;
-  dispatch();
+  if (activeBuffer.length >= FLUSH_THRESHOLD_BYTES) {
+    dispatch();
+  }
 }
 
 function dispatch(): void {
@@ -60,8 +77,15 @@ async function runWorker(id: number): Promise<void> {
         for (let r = 0; r < resolvers.length; r++) resolvers[r]!();
       }
 
+      const flushPromise = insertCsvPayload(payload);
+      activeWorkerPromises.push(flushPromise);
+      flushPromise.finally(() => {
+        const idx = activeWorkerPromises.indexOf(flushPromise);
+        if (idx !== -1) activeWorkerPromises.splice(idx, 1);
+      });
+
       try {
-        await insertCsvPayload(payload);
+        await flushPromise;
       } catch (err) {
         console.error(`Worker ${id} COPY flush error:`, err);
       }
@@ -74,12 +98,14 @@ async function runWorker(id: number): Promise<void> {
   }
 }
 
-// 5ms low-latency timer to dispatch any trailing logs in the buffer
+export const TRAILING_FLUSH_MS = 50;
+
+// 50ms trailing timer to dispatch any trailing logs in the buffer without event loop thrashing
 setInterval(() => {
   if (activeBuffer.length > 0) {
     dispatch();
   }
-}, 5);
+}, TRAILING_FLUSH_MS);
 
 /**
  * High-speed bulk insertion using PostgreSQL COPY stream
@@ -119,148 +145,90 @@ async function insertCsvPayload(payload: string): Promise<void> {
 }
 
 // ==========================================
-// Query Functions
-// ==========================================
-
 export async function queryLogs(
   query: LogsQuery,
   attributeFilters: Record<string, string>,
   cursor?: LogCursor,
 ) {
-  const hasAttrFilters = Object.keys(attributeFilters).length > 0;
-  const isSimpleReadAfterWrite =
-    query.service === undefined &&
-    query.level === undefined &&
-    query.since === undefined &&
-    query.until === undefined &&
-    query.q === undefined &&
-    cursor === undefined &&
-    !hasAttrFilters;
-
-  // Ultra-fast path for read-after-write (GET /logs?limit=20)
-  if (isSimpleReadAfterWrite) {
-    const res = await pool.query<{
-      id: number;
-      timestamp: Date;
-      level: "debug" | "info" | "warn" | "error";
-      service: string;
-      message: string;
-      attributes: Record<string, unknown>;
-      createdAt: Date;
-    }>(
-      `SELECT id, timestamp, level, service, message, attributes, created_at AS "createdAt"
-       FROM logs
-       ORDER BY timestamp DESC, id DESC
-       LIMIT $1`,
-      [query.limit + 1],
-    );
-    return res.rows;
-  }
-
-  // Fast path for service filtered query with cursor or default pagination
-  const isServiceOnly =
-    query.service !== undefined &&
-    query.level === undefined &&
-    query.since === undefined &&
-    query.until === undefined &&
-    query.q === undefined &&
-    !hasAttrFilters;
-
-  if (isServiceOnly) {
-    if (cursor !== undefined) {
-      const res = await pool.query<{
-        id: number;
-        timestamp: Date;
-        level: "debug" | "info" | "warn" | "error";
-        service: string;
-        message: string;
-        attributes: Record<string, unknown>;
-        createdAt: Date;
-      }>(
-        `SELECT id, timestamp, level, service, message, attributes, created_at AS "createdAt"
-         FROM logs
-         WHERE service = $1 AND (timestamp, id) < ($2, $3)
-         ORDER BY service, timestamp DESC, id DESC
-         LIMIT $4`,
-        [query.service, new Date(cursor.timestamp), cursor.id, query.limit + 1],
-      );
-      return res.rows;
-    } else {
-      const res = await pool.query<{
-        id: number;
-        timestamp: Date;
-        level: "debug" | "info" | "warn" | "error";
-        service: string;
-        message: string;
-        attributes: Record<string, unknown>;
-        createdAt: Date;
-      }>(
-        `SELECT id, timestamp, level, service, message, attributes, created_at AS "createdAt"
-         FROM logs
-         WHERE service = $1
-         ORDER BY service, timestamp DESC, id DESC
-         LIMIT $2`,
-        [query.service, query.limit + 1],
-      );
-      return res.rows;
-    }
-  }
-
-  const conditions = [];
+  const params: (string | number | Date)[] = [];
+  const whereClauses: string[] = [];
 
   if (query.service !== undefined) {
-    conditions.push(eq(logsTable.service, query.service));
+    params.push(query.service);
+    whereClauses.push(`service = $${params.length}`);
   }
 
   if (query.level !== undefined) {
-    conditions.push(eq(logsTable.level, query.level));
+    params.push(query.level);
+    whereClauses.push(`level = $${params.length}`);
   }
 
   if (query.since !== undefined) {
-    conditions.push(gte(logsTable.timestamp, new Date(query.since)));
+    params.push(new Date(query.since));
+    whereClauses.push(`timestamp >= $${params.length}`);
   }
 
   if (query.until !== undefined) {
-    conditions.push(lt(logsTable.timestamp, new Date(query.until)));
+    params.push(new Date(query.until));
+    whereClauses.push(`timestamp < $${params.length}`);
   }
 
   if (query.q !== undefined) {
-    const term = `%${query.q}%`;
-    conditions.push(sql`${logsTable.message} ILIKE ${term}`);
+    params.push(`%${query.q}%`);
+    whereClauses.push(`message ILIKE $${params.length}`);
   }
 
   if (cursor !== undefined) {
-    const cursorTimestamp = new Date(cursor.timestamp);
-    conditions.push(
-      sql`(${logsTable.timestamp}, ${logsTable.id}) < (${cursorTimestamp}, ${cursor.id})`,
-    );
-  }
-  for (const [key, value] of Object.entries(attributeFilters)) {
-    conditions.push(sql`${logsTable.attributes} @> ${JSON.stringify({ [key]: value })}::jsonb`);
+    params.push(new Date(cursor.timestamp), cursor.id);
+    whereClauses.push(`(timestamp, id) < ($${params.length - 1}, $${params.length})`);
   }
 
-  // Optimizer fence for GIN queries (q and attributes) to prevent slow backward heap scans
-  const hasGinFilter = query.q !== undefined || hasAttrFilters;
-  if (hasGinFilter) {
-    const subquery = db
-      .select()
-      .from(logsTable)
-      .where(and(...conditions))
-      .offset(0)
-      .as("filtered_logs");
-    return db
-      .select()
-      .from(subquery)
-      .orderBy(desc(subquery.timestamp), desc(subquery.id))
-      .limit(query.limit + 1);
+  const attrEntries = Object.entries(attributeFilters);
+  for (const [key, value] of attrEntries) {
+    const safeKey = key.replace(/'/g, "''");
+    params.push(value);
+    whereClauses.push(`attributes->>'${safeKey}' = $${params.length}`);
   }
 
-  return db
-    .select()
-    .from(logsTable)
-    .where(and(...conditions))
-    .orderBy(desc(logsTable.timestamp), desc(logsTable.id))
-    .limit(query.limit + 1);
+  params.push(query.limit + 1);
+  const limitParam = `$${params.length}`;
+
+  const whereSql = whereClauses.length > 0 ? `WHERE ${whereClauses.join(" AND ")}` : "";
+  const hasGinFilter = query.q !== undefined || attrEntries.length > 0;
+
+  // Use optimizer fence (OFFSET 0) for GIN-filtered queries to force GIN index usage instead of backward B-Tree scan
+  const sqlText = hasGinFilter
+    ? `
+      SELECT id, timestamp, level, service, message, attributes, created_at AS "createdAt"
+      FROM (
+        SELECT id, timestamp, level, service, message, attributes, created_at
+        FROM logs
+        ${whereSql}
+        ORDER BY timestamp DESC, id DESC
+        OFFSET 0
+      ) filtered
+      ORDER BY timestamp DESC, id DESC
+      LIMIT ${limitParam}
+    `
+    : `
+      SELECT id, timestamp, level, service, message, attributes, created_at AS "createdAt"
+      FROM logs
+      ${whereSql}
+      ORDER BY timestamp DESC, id DESC
+      LIMIT ${limitParam}
+    `;
+
+  const res = await readPool.query<{
+    id: number;
+    timestamp: Date;
+    level: "debug" | "info" | "warn" | "error";
+    service: string;
+    message: string;
+    attributes: Record<string, unknown>;
+    createdAt: Date;
+  }>(sqlText, params);
+
+  return res.rows;
 }
 
 export interface AggregateBucketResult {
@@ -318,7 +286,7 @@ export async function aggregateLogs(
       ${groupBySql}
     `;
 
-    const res = await pool.query<{ start: Date | string; group: string | null; count: number }>(
+    const res = await readPool.query<{ start: Date | string; group: string | null; count: number }>(
       sqlText,
       params,
     );
@@ -358,7 +326,7 @@ export async function aggregateLogs(
     conditions.push(sql`${logsTable.message} ILIKE ${term}`);
   }
   for (const [key, value] of Object.entries(attributeFilters)) {
-    conditions.push(sql`${logsTable.attributes} @> ${JSON.stringify({ [key]: value })}::jsonb`);
+    conditions.push(sql`${logsTable.attributes}->>${key} = ${value}`);
   }
 
   const groupByClause =

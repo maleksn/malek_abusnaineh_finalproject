@@ -1,5 +1,5 @@
 import { Router } from "express";
-import { pool } from "../db";
+import { pool, readPool } from "../db";
 import {
   logsQuerySchema,
   aggregateQuerySchema,
@@ -7,6 +7,7 @@ import {
 import type { ValidLog, LogsQuery } from "../validators/logs.validator";
 import {
   enqueueCsvChunk,
+  flushCurrentBuffer,
   queryLogs,
   aggregateLogs,
 } from "../services/logs.service";
@@ -22,9 +23,15 @@ type RejectedLog = {
   reason: string;
 };
 
-// Match the format used by the load test / z.iso.datetime()
-const isoTimestamp =
-  /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/;
+function isValidIsoTimestamp(ts: string): boolean {
+  const len = ts.length;
+  if (len < 20 || len > 30) return false;
+  if (ts.charCodeAt(len - 1) !== 90) return false; // 'Z'
+  if (ts.charCodeAt(4) !== 45 || ts.charCodeAt(7) !== 45) return false; // '-'
+  if (ts.charCodeAt(10) !== 84) return false; // 'T'
+  if (ts.charCodeAt(13) !== 58 || ts.charCodeAt(16) !== 58) return false; // ':'
+  return true;
+}
 
 const logsRouter = Router();
 
@@ -42,7 +49,7 @@ logsRouter.post("/", async (req, res) => {
   const lines: string[] = new Array(len);
   let acceptedCount = 0;
   let rejected: RejectedLog[] | null = null;
-  const maxFutureTimestamp = Date.now() + 300000;
+  const maxFutureIso = new Date(Date.now() + 300000).toISOString();
 
   for (let index = 0; index < len; index++) {
     const log = logs[index];
@@ -63,13 +70,12 @@ logsRouter.post("/", async (req, res) => {
       continue;
     }
 
-    if (!isoTimestamp.test(ts)) {
+    if (!isValidIsoTimestamp(ts)) {
       if (!rejected) rejected = [];
       rejected.push({ index, reason: "Invalid timestamp" });
       continue;
     }
 
-    const maxFutureIso = new Date(maxFutureTimestamp).toISOString();
     if (ts > maxFutureIso) {
       if (!rejected) rejected = [];
       rejected.push({
@@ -161,19 +167,19 @@ logsRouter.post("/", async (req, res) => {
       }
       if (hasInvalidAttr) continue;
       const jsonStr = JSON.stringify(attrsObj);
-      attrJson = `"${jsonStr.replaceAll('"', '""')}"`;
+      attrJson = `"${jsonStr.replace(/"/g, '""')}"`;
     }
 
     // Direct fast CSV formatting
     const escapedService =
       service.indexOf('"') === -1
         ? `"${service}"`
-        : `"${service.replaceAll('"', '""')}"`;
+        : `"${service.replace(/"/g, '""')}"`;
 
     const escapedMsg =
       message.indexOf('"') === -1
         ? `"${message}"`
-        : `"${message.replaceAll('"', '""')}"`;
+        : `"${message.replace(/"/g, '""')}"`;
 
     lines[acceptedCount++] = `"${ts}","${lvl}",${escapedService},${escapedMsg},${attrJson}`;
   }
@@ -205,40 +211,8 @@ logsRouter.post("/", async (req, res) => {
 });
 
 logsRouter.get("/", async (req, res) => {
-  // Ultra-fast zero-allocation path for read-after-write query: /logs?limit=20
-  const isSimpleLimit20 =
-    Object.keys(req.query).length === 1 && req.query.limit === "20";
-
-  if (isSimpleLimit20) {
-    const limitNum = Number(req.query.limit);
-    if (!Number.isInteger(limitNum) || limitNum < 1 || limitNum > 1000) {
-      return res.status(400).json({ error: "limit must be between 1 and 1000" });
-    }
-
-    try {
-      const sqlResult = await pool.query<{ json_response: string }>(
-        `SELECT json_build_object(
-           'logs', COALESCE((
-             SELECT json_agg(sub)
-             FROM (
-               SELECT id, timestamp, level, service, message, attributes, created_at AS "createdAt"
-               FROM logs
-               ORDER BY timestamp DESC, id DESC
-               LIMIT $1
-             ) sub
-           ), '[]'::json),
-           'next_cursor', NULL
-         )::text AS json_response`,
-        [limitNum],
-      );
-
-      res.setHeader("Content-Type", "application/json");
-      return res.status(200).send(sqlResult.rows[0]?.json_response || '{"logs":[],"next_cursor":null}');
-    } catch (err) {
-      console.error("GET /logs read-after-write error:", err);
-      return res.status(500).json({ error: "Query failed" });
-    }
-  }
+  // Ensure any in-flight buffer is flushed for 100% read-after-write consistency
+  await flushCurrentBuffer();
 
   const queryResult = logsQuerySchema.safeParse(req.query);
   if (!queryResult.success) {
@@ -340,22 +314,28 @@ logsRouter.get("/aggregate", async (req, res) => {
           : "GROUP BY 1 ORDER BY 1";
 
       const sqlText = `
-        SELECT json_build_object(
-          'buckets', COALESCE((
-            SELECT json_agg(json_build_object('start', sub.start, 'group', sub."group", 'count', sub.count))
-            FROM (
-              SELECT ${bucketSql} AS start, ${groupCol} AS "group", count(*)::int AS count
-              FROM logs
-              WHERE ${whereClauses.join(" AND ")}
-              ${groupBySql}
-            ) sub
-          ), '[]'::json)
-        )::text AS json_response
+        SELECT ${bucketSql} AS start, ${groupCol} AS "group", count(*)::int AS count
+        FROM logs
+        WHERE ${whereClauses.join(" AND ")}
+        ${groupBySql}
       `;
 
-      const sqlResult = await pool.query<{ json_response: string }>(sqlText, params);
-      res.setHeader("Content-Type", "application/json");
-      return res.status(200).send(sqlResult.rows[0]?.json_response || '{"buckets":[]}');
+      const sqlResult = await readPool.query<{
+        start: Date | string;
+        group: string | null;
+        count: number;
+      }>(sqlText, params);
+
+      return res.status(200).json({
+        buckets: sqlResult.rows.map((row) => ({
+          start:
+            row.start instanceof Date
+              ? row.start.toISOString()
+              : new Date(String(row.start)).toISOString(),
+          group: row.group,
+          count: row.count,
+        })),
+      });
     } catch (err) {
       console.error("GET /logs/aggregate error:", err);
       return res.status(500).json({ error: "Aggregation query failed" });

@@ -88,8 +88,9 @@ async function startServer(): Promise<void> {
     console.log(`Server is running on http://localhost:${PORT}`);
   });
 
-  server.keepAliveTimeout = 30000;
-  server.headersTimeout = 31000;
+  server.keepAliveTimeout = 65000;
+  server.headersTimeout = 66000;
+  server.maxRequestsPerSocket = 0;
 
   console.log("Waiting for database...");
   await waitForDatabase();
