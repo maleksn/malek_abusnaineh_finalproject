@@ -3,13 +3,16 @@ import { Pool, types } from "pg";
 import { drizzle } from "drizzle-orm/node-postgres";
 import { migrate } from "drizzle-orm/node-postgres/migrator";
 
-// High-performance type parsers:
-// OID 20: int8 / bigserial / count(*) as JavaScript number
+// =========================================================================
+// DATA CONVERSION HELPERS: Fast translation from Postgres types to JavaScript
+// =========================================================================
+
+// Convert 64-bit big numbers from Postgres directly to standard JavaScript numbers
 types.setTypeParser(20, (val: string) => Number(val));
-// OID 1184: timestamptz - format to standard ISO-8601 string without Date object overhead
+
+// Convert Postgres timestamp strings to clean ISO-8601 UTC date strings (e.g. '2026-08-18T19:40:00Z')
 types.setTypeParser(1184, (val: string) => {
   if (!val) return val;
-  // Convert Postgres timestamptz text (e.g. '2026-08-18 19:40:00.123+00') to ISO-8601
   let s = val.indexOf("T") === -1 ? val.replace(" ", "T") : val;
   if (s.endsWith("+00") || s.endsWith("+00:00")) {
     return s.replace(/\+00(:00)?$/, "Z");
@@ -19,16 +22,21 @@ types.setTypeParser(1184, (val: string) => {
   }
   return s;
 });
-// OID 1114: timestamp without timezone
+
+// Convert timestamp without timezone to standard UTC ISO string
 types.setTypeParser(1114, (val: string) => {
   if (!val) return val;
   return val.indexOf("T") === -1 ? val.replace(" ", "T") + "Z" : val;
 });
 
-// Dedicated write pool for high-throughput ingestion workers
+// =========================================================================
+// DATABASE CONNECTIONS: Separate pools for Writing and Reading
+// =========================================================================
+
+// WRITE POOL: Used exclusively for inserting new logs quickly
 export const pool = new Pool({
   connectionString: process.env.DATABASE_URL!,
-  max: 3,
+  max: 4,
   idleTimeoutMillis: 30000,
 });
 
@@ -36,7 +44,7 @@ pool.on("error", (err) => {
   console.error("Unexpected error on idle write database client:", err);
 });
 
-// Dedicated read pool isolated from ingestion writes to prevent connection starvation
+// READ POOL: Used exclusively for search queries and dashboards so heavy writes don't slow down reads
 export const readPool = new Pool({
   connectionString: process.env.DATABASE_URL!,
   max: 4,
@@ -50,6 +58,9 @@ readPool.on("error", (err) => {
 
 export const db = drizzle(pool);
 
+/**
+ * DATA FLOW: Tests whether both Write and Read connections to the database are responsive.
+ */
 export async function checkDatabaseConnection(): Promise<void> {
   await Promise.all([
     pool.query("SELECT 1"),
@@ -60,6 +71,9 @@ export async function checkDatabaseConnection(): Promise<void> {
   ]);
 }
 
+/**
+ * DATA FLOW: Applies database schema migrations (creates tables and indexes) on application startup.
+ */
 export async function runMigrations(): Promise<void> {
   try {
     await migrate(db, {

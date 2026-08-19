@@ -22,6 +22,7 @@ type RejectedLog = {
   reason: string;
 };
 
+// Helper: Quickly checks if a timestamp is a valid ISO-8601 string (e.g. 2026-08-19T12:00:00Z)
 function isValidIsoTimestamp(ts: string): boolean {
   const len = ts.length;
   if (len < 19 || len > 35) return false;
@@ -32,6 +33,7 @@ function isValidIsoTimestamp(ts: string): boolean {
   return !Number.isNaN(parsed);
 }
 
+// Cache current time + 5 minutes to avoid calculating it for every individual log
 let cachedMaxFutureMs = Date.now() + 300000;
 setInterval(() => {
   cachedMaxFutureMs = Date.now() + 300000;
@@ -39,9 +41,22 @@ setInterval(() => {
 
 const logsRouter = Router();
 
+// =========================================================================
+// INGESTION: POST /logs (Receive, validate, format, and save logs)
+// =========================================================================
+/**
+ * DATA FLOW:
+ * Step 1: Receive JSON payload containing an array of logs from client.
+ * Step 2: Validate each log one by one (timestamp, level, service, message, attributes).
+ * Step 3: Separate valid logs from invalid ones (record rejection reason if invalid).
+ * Step 4: Convert valid logs into fast CSV text rows.
+ * Step 5: Send CSV to ingestion queue and wait until saved in PostgreSQL.
+ * Step 6: Return count of accepted and rejected logs to the client.
+ */
 logsRouter.post("/", async (req, res, next) => {
   const rawLogs = (req.body as { logs?: unknown } | null | undefined)?.logs;
 
+  // Step 1: Ensure request contains a non-empty logs array
   if (!Array.isArray(rawLogs) || rawLogs.length === 0) {
     return res.status(400).json({
       error: "Invalid request body",
@@ -55,6 +70,7 @@ logsRouter.post("/", async (req, res, next) => {
   let rejected: RejectedLog[] | null = null;
   const maxFutureMs = cachedMaxFutureMs;
 
+  // Step 2: Inspect each log item in the array
   for (let index = 0; index < len; index++) {
     const log = logs[index];
 
@@ -66,7 +82,7 @@ logsRouter.post("/", async (req, res, next) => {
 
     const input = log as Record<string, unknown>;
 
-    // 1. timestamp validation
+    // 1. Timestamp validation (must be valid ISO date and not > 5 min in future)
     const ts = input.timestamp;
     if (typeof ts !== "string") {
       if (!rejected) rejected = [];
@@ -90,7 +106,7 @@ logsRouter.post("/", async (req, res, next) => {
       continue;
     }
 
-    // 2. level validation
+    // 2. Level validation (must be debug, info, warn, or error)
     const lvl = input.level;
     if (
       lvl !== "debug" &&
@@ -103,7 +119,7 @@ logsRouter.post("/", async (req, res, next) => {
       continue;
     }
 
-    // 3. service validation
+    // 3. Service validation (must be non-empty string without null bytes)
     const srv = input.service;
     if (typeof srv !== "string") {
       if (!rejected) rejected = [];
@@ -126,7 +142,7 @@ logsRouter.post("/", async (req, res, next) => {
       continue;
     }
 
-    // 4. message validation
+    // 4. Message validation (must be non-empty string without null bytes)
     const msg = input.message;
     if (typeof msg !== "string") {
       if (!rejected) rejected = [];
@@ -149,7 +165,7 @@ logsRouter.post("/", async (req, res, next) => {
       continue;
     }
 
-    // 5. attributes validation & direct CSV serialization
+    // 5. Attributes validation (must be key-value object of strings, numbers, or booleans)
     let attrJson = '"{}"';
     const rawAttrs = input.attributes;
     if (rawAttrs !== undefined) {
@@ -192,7 +208,7 @@ logsRouter.post("/", async (req, res, next) => {
       attrJson = `"${jsonStr.replace(/"/g, '""')}"`;
     }
 
-    // Direct fast CSV formatting
+    // Step 4: Format valid log into a CSV row
     const escapedService =
       service.indexOf('"') === -1
         ? `"${service}"`
@@ -206,9 +222,10 @@ logsRouter.post("/", async (req, res, next) => {
     lines[acceptedCount++] = `"${ts}","${lvl}",${escapedService},${escapedMsg},${attrJson}`;
   }
 
-  // Free body reference immediately
+  // Free memory of original request body
   (req as unknown as { body: unknown }).body = null;
 
+  // If no logs passed validation, return 400 Bad Request
   if (acceptedCount === 0) {
     return res.status(400).json({
       accepted: 0,
@@ -216,6 +233,7 @@ logsRouter.post("/", async (req, res, next) => {
     });
   }
 
+  // Step 5: Send valid CSV logs to ingestion queue and wait for Postgres write
   lines.length = acceptedCount;
   const validCsvChunk = lines.join("\n") + "\n";
 
@@ -225,6 +243,7 @@ logsRouter.post("/", async (req, res, next) => {
     return res.status(500).json({ error: "Ingestion failed" });
   }
 
+  // Step 6: Return successful response
   if (!rejected || rejected.length === 0) {
     res.setHeader("Content-Type", "application/json");
     return res.status(200).send(`{"accepted":${acceptedCount},"rejected":[]}`);
@@ -236,7 +255,20 @@ logsRouter.post("/", async (req, res, next) => {
   });
 });
 
+// =========================================================================
+// QUERY: GET /logs (Search and paginate logs)
+// =========================================================================
+/**
+ * DATA FLOW:
+ * Step 1: Read and validate URL query parameters (level, service, time range, search text, limit, cursor).
+ * Step 2: Extract custom attribute filters (e.g. ?attr.env=prod).
+ * Step 3: If a pagination cursor is provided, decode it to find the last seen log timestamp and ID.
+ * Step 4: Query the database for matching logs up to limit + 1 (to check if more pages exist).
+ * Step 5: If there are more logs, generate a next_cursor token for the next page.
+ * Step 6: Return the list of logs and the next_cursor to the client.
+ */
 logsRouter.get("/", async (req, res) => {
+  // Step 1: Validate query parameters
   const queryResult = logsQuerySchema.safeParse(req.query);
   if (!queryResult.success) {
     const error = queryResult.error.issues
@@ -245,8 +277,11 @@ logsRouter.get("/", async (req, res) => {
     return res.status(400).json({ error });
   }
   const query = queryResult.data;
+
+  // Step 2: Extract dynamic attribute filters (attr.*)
   const attributeFilters = extractAttributeFilters(req.query);
 
+  // Step 3: Decode cursor if client wants the next page
   let cursor;
   if (query.cursor !== undefined) {
     try {
@@ -258,13 +293,15 @@ logsRouter.get("/", async (req, res) => {
     }
   }
 
+  // Step 4: Retrieve logs from database
   const logs = await queryLogs(query, attributeFilters, cursor);
 
+  // Step 5: Check if there is another page
   const hasMore = logs.length > query.limit;
   const page = hasMore ? logs.slice(0, query.limit) : logs;
-
   const lastLog = page[page.length - 1];
 
+  // Step 6: Create next_cursor token if more logs exist
   const nextCursor =
     hasMore && lastLog
       ? encodeCursor({
@@ -279,7 +316,18 @@ logsRouter.get("/", async (req, res) => {
   });
 });
 
+// =========================================================================
+// AGGREGATION: GET /logs/aggregate (Group log counts into time buckets)
+// =========================================================================
+/**
+ * DATA FLOW:
+ * Step 1: Validate required parameters (since, until, bucket size: 1m, 5m, 1h, 1d).
+ * Step 2: Extract any custom attribute filters or group_by (service, level).
+ * Step 3: Execute SQL aggregation query to count logs in each time bucket.
+ * Step 4: Format time bucket intervals and return results to the client.
+ */
 logsRouter.get("/aggregate", async (req, res) => {
+  // Step 1: Validate query parameters
   const queryResult = aggregateQuerySchema.safeParse(req.query);
 
   if (!queryResult.success) {
@@ -296,7 +344,7 @@ logsRouter.get("/aggregate", async (req, res) => {
   const attributeFilters = extractAttributeFilters(req.query);
   const hasAttrFilters = Object.keys(attributeFilters).length > 0;
 
-  // Ultra-fast zero-allocation path for Index-Only aggregation
+  // Fast path: Direct index calculation for simple filters (no message search or JSON attributes)
   if (!hasAttrFilters && query.q === undefined) {
     try {
       const params: (string | Date)[] = [new Date(query.since), new Date(query.until)];
@@ -359,6 +407,7 @@ logsRouter.get("/aggregate", async (req, res) => {
     }
   }
 
+  // Fallback path: Full aggregation for queries with text search or attribute filters
   try {
     const buckets = await aggregateLogs(query, attributeFilters);
 
@@ -378,11 +427,16 @@ logsRouter.get("/aggregate", async (req, res) => {
   }
 });
 
-// retention routes
+// =========================================================================
+// RETENTION: Check status and manually trigger cleanup of old logs
+// =========================================================================
+
+// Check current retention policy status (e.g. 30 days retention, last run stats)
 logsRouter.get("/retention/status", (_req, res) => {
   return res.status(200).json(getRetentionStatus());
 });
 
+// Manually trigger a cleanup of expired logs older than specified days
 logsRouter.post("/retention/cleanup", async (req, res) => {
   const days = req.body?.days !== undefined ? Number(req.body.days) : undefined;
   const batchSize = req.body?.batch_size !== undefined ? Number(req.body.batch_size) : undefined;

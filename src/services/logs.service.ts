@@ -10,114 +10,108 @@ import { from as copyFrom } from "pg-copy-streams";
 import { createHash } from "node:crypto";
 
 // =========================================================================
-// Dual-Worker Atomic Buffer Swap Ingestion Engine (Zero-OOM, Max Throughput)
+// Group-Commit Ingestion Engine (ack only after PostgreSQL commit)
 // =========================================================================
+
+interface PendingPayload {
+  data: string;
+  bytes: number;
+  resolve: () => void;
+  reject: (err: Error) => void;
+}
+
+// One worker per connection in the write pool (pool.max = 3 or 4)
 const NUM_WORKERS = 3;
-const workerBusy = [false, false, false];
-let activeBuffer = "";
-let flushResolvers: (() => void)[] = [];
-let activeWorkerPromises: Promise<void>[] = [];
-let flushTimer: NodeJS.Timeout | null = null;
-const FLUSH_THRESHOLD_BYTES = 64 * 1024; // 64KB (~500 logs)
-const MAX_BUFFER_BACKPRESSURE_BYTES = 128 * 1024; // 128KB backpressure limit (~1,000 logs max)
 
-/**
- * Instant consistency barrier for read-after-write queries.
- * Flushes any pending logs in activeBuffer and awaits all in-flight worker commits.
- */
-export async function flushCurrentBuffer(): Promise<void> {
-  if (flushTimer) {
-    clearTimeout(flushTimer);
-    flushTimer = null;
-  }
-  while (activeBuffer.length > 0 || activeWorkerPromises.length > 0) {
-    if (activeBuffer.length > 0) dispatch();
-    if (activeWorkerPromises.length > 0) {
-      await Promise.all([...activeWorkerPromises]);
-    }
-    // Yield to event loop to allow worker 'finally' blocks to execute and update the promises array
-    await new Promise((resolve) => setImmediate(resolve));
-  }
-}
+// Memory cap for uncommitted pending data (512 KB)
+const MAX_PENDING_BYTES = 512 * 1024;
 
-/**
- * Enqueue a pre-serialized CSV string chunk directly.
- * Backpressure: If activeBuffer exceeds MAX_BUFFER_BACKPRESSURE_BYTES,
- * await ongoing buffer swap before accepting more data to prevent unbounded memory growth.
- */
-export async function enqueueCsvChunk(chunk: string): Promise<void> {
-  if (!chunk) return;
+// Size limit for a single COPY command: bounded prefix from the queue.
+// Keeps individual COPY operations fast and allows workers to share bursts in parallel.
+const MAX_COPY_BYTES = 128 * 1024;
 
-  if (activeBuffer.length >= MAX_BUFFER_BACKPRESSURE_BYTES) {
-    await new Promise<void>((resolve) => flushResolvers.push(resolve));
-  }
+const workerBusy: boolean[] = new Array(NUM_WORKERS).fill(false);
 
-  activeBuffer += chunk;
-  if (activeBuffer.length >= FLUSH_THRESHOLD_BYTES) {
-    if (flushTimer) {
-      clearTimeout(flushTimer);
-      flushTimer = null;
-    }
-    dispatch();
-  } else if (!flushTimer) {
-    flushTimer = setTimeout(() => {
-      flushTimer = null;
-      if (activeBuffer.length > 0) {
-        dispatch();
-      }
-    }, 10);
-  }
-}
+let queue: PendingPayload[] = [];
+let pendingBytes = 0;
+let drainWaiters: (() => void)[] = [];
 
 function dispatch(): void {
   for (let i = 0; i < NUM_WORKERS; i++) {
-    if (!workerBusy[i] && activeBuffer.length > 0) {
-      void runWorker(i);
-    }
+    if (!workerBusy[i] && queue.length > 0) void runWorker(i);
   }
+}
+
+function takeBatch(): PendingPayload[] {
+  let cut = 0;
+  let bytes = 0;
+  while (cut < queue.length) {
+    const next = queue[cut]!;
+    if (cut > 0 && bytes + next.bytes > MAX_COPY_BYTES) break;
+    bytes += next.bytes;
+    cut++;
+  }
+  const batch = queue.slice(0, cut);
+  queue = queue.slice(cut);
+  pendingBytes -= bytes;
+  return batch;
 }
 
 async function runWorker(id: number): Promise<void> {
   if (workerBusy[id]) return;
   workerBusy[id] = true;
-
   try {
-    while (activeBuffer.length > 0) {
-      // Synchronously and atomically swap activeBuffer before any async operation
-      const payload = activeBuffer;
-      activeBuffer = "";
-
-      // Notify any awaiting backpressure requests that buffer has been swapped
-      if (flushResolvers.length > 0) {
-        const resolvers = flushResolvers;
-        flushResolvers = [];
-        for (let r = 0; r < resolvers.length; r++) resolvers[r]!();
-      }
-
-      const flushPromise = insertCsvPayload(payload);
-      activeWorkerPromises.push(flushPromise);
+    while (queue.length > 0) {
+      const batch = takeBatch();
+      const data = batch.map((p) => p.data).join("");
 
       try {
-        await flushPromise;
+        await insertCsvPayload(data);
+        for (const p of batch) p.resolve();
       } catch (err) {
         const error = err instanceof Error ? err : new Error(String(err));
         console.error(`Worker ${id} COPY flush error:`, error.message);
+        for (const p of batch) p.reject(error);
       } finally {
-        const idx = activeWorkerPromises.indexOf(flushPromise);
-        if (idx !== -1) activeWorkerPromises.splice(idx, 1);
+        // Paced admission: wake up only as many requests as were committed in this batch.
+        // Admission rate matches actual database commit rate to keep queue small
+        // and eliminate thundering herds.
+        const wake = Math.min(batch.length, drainWaiters.length);
+        for (let i = 0; i < wake; i++) {
+          const w = drainWaiters.shift();
+          if (w) w();
+        }
       }
     }
   } finally {
     workerBusy[id] = false;
-    if (activeBuffer.length > 0) {
-      dispatch();
-    }
+    if (queue.length > 0) dispatch();
+  }
+}
+
+export async function enqueueCsvChunk(chunk: string): Promise<void> {
+  if (!chunk) return;
+
+  while (pendingBytes >= MAX_PENDING_BYTES) {
+    await new Promise<void>((r) => drainWaiters.push(r));
+  }
+
+  await new Promise<void>((resolve, reject) => {
+    pendingBytes += chunk.length;
+    queue.push({ data: chunk, bytes: chunk.length, resolve, reject });
+    dispatch();
+  });
+}
+
+export async function flushCurrentBuffer(): Promise<void> {
+  while (queue.length > 0 || workerBusy.some((b) => b)) {
+    await new Promise((r) => setImmediate(r));
   }
 }
 
 /**
- * High-speed bulk insertion using PostgreSQL COPY stream.
- * Propagates all errors to caller and ensures proper client cleanup on error.
+ * DATA FLOW: High-speed bulk insertion directly into PostgreSQL table.
+ * Uses PostgreSQL COPY stream for maximum speed.
  */
 async function insertCsvPayload(payload: string): Promise<void> {
   if (!payload) return;
@@ -149,7 +143,17 @@ async function insertCsvPayload(payload: string): Promise<void> {
   }
 }
 
-// ==========================================
+// =========================================================================
+// Query Engine (Reading and filtering logs from the database)
+// =========================================================================
+
+/**
+ * DATA FLOW: Searches and retrieves logs based on user filters.
+ * Step 1: Collect user filters (service name, log level, time range, search text, custom attributes).
+ * Step 2: If a pagination cursor is provided, fetch logs older than that cursor.
+ * Step 3: Build the SQL query and execute it on the read database pool.
+ * Step 4: Format and return the matching log entries to the caller.
+ */
 export async function queryLogs(
   query: LogsQuery,
   attributeFilters: Record<string, string>,
@@ -158,49 +162,57 @@ export async function queryLogs(
   const params: (string | number | Date)[] = [];
   const whereClauses: string[] = [];
 
+  // Filter 1: By service name
   if (query.service !== undefined) {
     params.push(query.service);
     whereClauses.push(`service = $${params.length}`);
   }
 
+  // Filter 2: By log level (debug, info, warn, error)
   if (query.level !== undefined) {
     params.push(query.level);
     whereClauses.push(`level = $${params.length}`);
   }
 
+  // Filter 3: Start time (since)
   if (query.since !== undefined) {
     params.push(new Date(query.since));
     whereClauses.push(`timestamp >= $${params.length}`);
   }
 
+  // Filter 4: End time (until)
   if (query.until !== undefined) {
     params.push(new Date(query.until));
     whereClauses.push(`timestamp < $${params.length}`);
   }
 
+  // Filter 5: Search keyword inside the message
   if (query.q !== undefined) {
     params.push(`%${query.q}%`);
     whereClauses.push(`message ILIKE $${params.length}`);
   }
 
+  // Filter 6: Pagination cursor (fetch items after this point in time/ID)
   if (cursor !== undefined) {
     params.push(new Date(cursor.timestamp), cursor.id);
     whereClauses.push(`(timestamp, id) < ($${params.length - 1}, $${params.length})`);
   }
 
+  // Filter 7: Custom JSON attribute filters (e.g., attr.user_id = 123)
   const attrEntries = Object.entries(attributeFilters);
   for (const [key, value] of attrEntries) {
     params.push(key, value);
     whereClauses.push(`attributes->>$${params.length - 1} = $${params.length}`);
   }
 
+  // Fetch 1 extra item to check if there is a next page
   params.push(query.limit + 1);
   const limitParam = `$${params.length}`;
 
   const whereSql = whereClauses.length > 0 ? `WHERE ${whereClauses.join(" AND ")}` : "";
   const hasGinFilter = query.q !== undefined || attrEntries.length > 0;
 
-  // Use optimizer fence (OFFSET 0) for GIN-filtered queries to force GIN index usage instead of backward B-Tree scan
+  // Build the final SQL query (ordered newest first)
   const sqlText = hasGinFilter
     ? `
       SELECT id, timestamp, level, service, message, attributes
@@ -224,6 +236,7 @@ export async function queryLogs(
 
   const queryName = "q_logs_" + createHash("md5").update(sqlText).digest("hex").slice(0, 16);
 
+  // Execute query on read pool
   const res = await readPool.query<{
     id: number | string;
     timestamp: Date | string;
@@ -237,6 +250,7 @@ export async function queryLogs(
     values: params,
   });
 
+  // Convert database rows into clean JSON response format
   return res.rows.map((row) => ({
     id: String(row.id),
     timestamp:
@@ -256,13 +270,20 @@ export interface AggregateBucketResult {
   count: number;
 }
 
+/**
+ * DATA FLOW: Groups and counts logs into time buckets (1m, 5m, 1h, 1d).
+ * Step 1: Determine the bucket size in minutes/hours/days.
+ * Step 2: Apply time range and optional service/level filters.
+ * Step 3: Run database aggregation query to count logs in each bucket.
+ * Step 4: Return list of buckets with their counts.
+ */
 export async function aggregateLogs(
   query: AggregateQuery,
   attributeFilters: Record<string, string>,
 ): Promise<AggregateBucketResult[]> {
   const hasAttrFilters = Object.keys(attributeFilters).length > 0;
 
-  // Pure Index-Only Scan path on logs_timestamp_service_level_idx
+  // Fast path: Simple queries can be counted directly from database index
   if (!hasAttrFilters && query.q === undefined) {
     const params: (string | Date)[] = [new Date(query.since), new Date(query.until)];
     const whereClauses: string[] = ["timestamp >= $1", "timestamp < $2"];
