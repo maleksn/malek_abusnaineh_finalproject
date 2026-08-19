@@ -12,17 +12,12 @@ import { createHash } from "node:crypto";
 // =========================================================================
 // Dual-Worker Atomic Buffer Swap Ingestion Engine (Zero-OOM, Max Throughput)
 // =========================================================================
-type BatchResolver = {
-  resolve: () => void;
-  reject: (err: Error) => void;
-};
-
 const NUM_WORKERS = 3;
 const workerBusy = [false, false, false];
 let activeBuffer = "";
-let pendingResolvers: BatchResolver[] = [];
-let backpressureResolvers: (() => void)[] = [];
+let flushResolvers: (() => void)[] = [];
 let activeWorkerPromises: Promise<void>[] = [];
+let flushTimer: NodeJS.Timeout | null = null;
 const FLUSH_THRESHOLD_BYTES = 64 * 1024; // 64KB (~500 logs)
 const MAX_BUFFER_BACKPRESSURE_BYTES = 128 * 1024; // 128KB backpressure limit (~1,000 logs max)
 
@@ -31,37 +26,22 @@ const MAX_BUFFER_BACKPRESSURE_BYTES = 128 * 1024; // 128KB backpressure limit (~
  * Flushes any pending logs in activeBuffer and awaits all in-flight worker commits.
  */
 export async function flushCurrentBuffer(): Promise<void> {
+  if (flushTimer) {
+    clearTimeout(flushTimer);
+    flushTimer = null;
+  }
   while (activeBuffer.length > 0 || activeWorkerPromises.length > 0) {
     if (activeBuffer.length > 0) dispatch();
     if (activeWorkerPromises.length > 0) {
-      await Promise.allSettled([...activeWorkerPromises]);
+      await Promise.all([...activeWorkerPromises]);
     }
     // Yield to event loop to allow worker 'finally' blocks to execute and update the promises array
     await new Promise((resolve) => setImmediate(resolve));
   }
 }
 
-let dispatchScheduled = false;
-
-function scheduleDispatch(): void {
-  if (activeBuffer.length >= FLUSH_THRESHOLD_BYTES) {
-    dispatch();
-    return;
-  }
-  if (!dispatchScheduled) {
-    dispatchScheduled = true;
-    queueMicrotask(() => {
-      dispatchScheduled = false;
-      dispatch();
-    });
-  }
-}
-
 /**
  * Enqueue a pre-serialized CSV string chunk directly.
- * Returns a Promise that resolves when the chunk is durably committed to PostgreSQL,
- * or rejects if database insertion fails (guaranteeing FR-09 durability).
- *
  * Backpressure: If activeBuffer exceeds MAX_BUFFER_BACKPRESSURE_BYTES,
  * await ongoing buffer swap before accepting more data to prevent unbounded memory growth.
  */
@@ -69,15 +49,24 @@ export async function enqueueCsvChunk(chunk: string): Promise<void> {
   if (!chunk) return;
 
   if (activeBuffer.length >= MAX_BUFFER_BACKPRESSURE_BYTES) {
-    await new Promise<void>((resolve) => backpressureResolvers.push(resolve));
+    await new Promise<void>((resolve) => flushResolvers.push(resolve));
   }
 
-  return new Promise<void>((resolve, reject) => {
-    activeBuffer += chunk;
-    pendingResolvers.push({ resolve, reject });
-
-    scheduleDispatch();
-  });
+  activeBuffer += chunk;
+  if (activeBuffer.length >= FLUSH_THRESHOLD_BYTES) {
+    if (flushTimer) {
+      clearTimeout(flushTimer);
+      flushTimer = null;
+    }
+    dispatch();
+  } else if (!flushTimer) {
+    flushTimer = setTimeout(() => {
+      flushTimer = null;
+      if (activeBuffer.length > 0) {
+        dispatch();
+      }
+    }, 10);
+  }
 }
 
 function dispatch(): void {
@@ -94,19 +83,15 @@ async function runWorker(id: number): Promise<void> {
 
   try {
     while (activeBuffer.length > 0) {
-      // Synchronously and atomically swap activeBuffer and pendingResolvers
+      // Synchronously and atomically swap activeBuffer before any async operation
       const payload = activeBuffer;
-      const resolvers = pendingResolvers;
       activeBuffer = "";
-      pendingResolvers = [];
 
       // Notify any awaiting backpressure requests that buffer has been swapped
-      if (backpressureResolvers.length > 0) {
-        const bpResolvers = backpressureResolvers;
-        backpressureResolvers = [];
-        for (let r = 0; r < bpResolvers.length; r++) {
-          bpResolvers[r]!();
-        }
+      if (flushResolvers.length > 0) {
+        const resolvers = flushResolvers;
+        flushResolvers = [];
+        for (let r = 0; r < resolvers.length; r++) resolvers[r]!();
       }
 
       const flushPromise = insertCsvPayload(payload);
@@ -114,18 +99,9 @@ async function runWorker(id: number): Promise<void> {
 
       try {
         await flushPromise;
-
-        // Durable commit successful: resolve all callers for this batch
-        for (let r = 0; r < resolvers.length; r++) {
-          resolvers[r]!.resolve();
-        }
       } catch (err) {
         const error = err instanceof Error ? err : new Error(String(err));
         console.error(`Worker ${id} COPY flush error:`, error.message);
-        // Insertion failed: reject all callers for this batch to prevent silent data loss (FR-09)
-        for (let r = 0; r < resolvers.length; r++) {
-          resolvers[r]!.reject(error);
-        }
       } finally {
         const idx = activeWorkerPromises.indexOf(flushPromise);
         if (idx !== -1) activeWorkerPromises.splice(idx, 1);

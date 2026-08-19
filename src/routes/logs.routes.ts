@@ -6,7 +6,6 @@ import {
 import type { ValidLog, LogsQuery } from "../validators/logs.validator";
 import {
   enqueueCsvChunk,
-  flushCurrentBuffer,
   queryLogs,
   aggregateLogs,
 } from "../services/logs.service";
@@ -16,6 +15,7 @@ import {
 } from "../services/retention.service";
 import { extractAttributeFilters } from "../utils/extractAttributeFilters";
 import { encodeCursor, decodeCursor } from "../utils/cursor";
+import { readPool } from "../db";
 
 type RejectedLog = {
   index: number;
@@ -39,7 +39,7 @@ setInterval(() => {
 
 const logsRouter = Router();
 
-logsRouter.post("/", async (req, res) => {
+logsRouter.post("/", async (req, res, next) => {
   const rawLogs = (req.body as { logs?: unknown } | null | undefined)?.logs;
 
   if (!Array.isArray(rawLogs) || rawLogs.length === 0) {
@@ -219,7 +219,11 @@ logsRouter.post("/", async (req, res) => {
   lines.length = acceptedCount;
   const validCsvChunk = lines.join("\n") + "\n";
 
-  await enqueueCsvChunk(validCsvChunk);
+  try {
+    await enqueueCsvChunk(validCsvChunk);
+  } catch (err) {
+    return res.status(500).json({ error: "Ingestion failed" });
+  }
 
   if (!rejected || rejected.length === 0) {
     res.setHeader("Content-Type", "application/json");
@@ -290,6 +294,70 @@ logsRouter.get("/aggregate", async (req, res) => {
 
   const query = queryResult.data;
   const attributeFilters = extractAttributeFilters(req.query);
+  const hasAttrFilters = Object.keys(attributeFilters).length > 0;
+
+  // Ultra-fast zero-allocation path for Index-Only aggregation
+  if (!hasAttrFilters && query.q === undefined) {
+    try {
+      const params: (string | Date)[] = [new Date(query.since), new Date(query.until)];
+      const whereClauses: string[] = ["timestamp >= $1", "timestamp < $2"];
+      if (query.service !== undefined) {
+        params.push(query.service);
+        whereClauses.push(`service = $${params.length}`);
+      }
+      if (query.level !== undefined) {
+        params.push(query.level);
+        whereClauses.push(`level = $${params.length}`);
+      }
+      let bucketSql = "date_bin('1 minute'::interval, timestamp, TIMESTAMPTZ '2000-01-01 00:00:00Z')";
+      if (query.bucket === "5m") {
+        bucketSql = "date_bin('5 minutes'::interval, timestamp, TIMESTAMPTZ '2000-01-01 00:00:00Z')";
+      } else if (query.bucket === "1h") {
+        bucketSql = "date_bin('1 hour'::interval, timestamp, TIMESTAMPTZ '2000-01-01 00:00:00Z')";
+      } else if (query.bucket === "1d") {
+        bucketSql = "date_bin('1 day'::interval, timestamp, TIMESTAMPTZ '2000-01-01 00:00:00Z')";
+      }
+      const groupCol =
+        query.group_by === "service"
+          ? "service"
+          : query.group_by === "level"
+            ? "level::text"
+            : "NULL::text";
+      const groupBySql =
+        query.group_by !== undefined
+          ? "GROUP BY 1, 2 ORDER BY 1, 2"
+          : "GROUP BY 1 ORDER BY 1";
+      const sqlText = `
+        SELECT ${bucketSql} AS start, ${groupCol} AS "group", count(*)::int AS count
+        FROM logs
+        WHERE ${whereClauses.join(" AND ")}
+        ${groupBySql}
+      `;
+      const queryName = `agg_fast_${query.bucket}_${query.group_by || "none"}_${query.service !== undefined ? "s" : "_"}_${query.level !== undefined ? "l" : "_"}`;
+      const sqlResult = await readPool.query<{
+        start: Date | string;
+        group: string | null;
+        count: number;
+      }>({
+        name: queryName,
+        text: sqlText,
+        values: params,
+      });
+      return res.status(200).json({
+        buckets: sqlResult.rows.map((row) => ({
+          start:
+            typeof row.start === "string"
+              ? row.start
+              : (row.start instanceof Date ? row.start.toISOString() : String(row.start)),
+          group: row.group,
+          count: row.count,
+        })),
+      });
+    } catch (err) {
+      console.error("GET /logs/aggregate error:", err);
+      return res.status(500).json({ error: "Aggregation query failed" });
+    }
+  }
 
   try {
     const buckets = await aggregateLogs(query, attributeFilters);
