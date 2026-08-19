@@ -324,7 +324,7 @@ Arbitrary key/value attributes are stored using PostgreSQL's binary JSON format 
 ### Key Design Decisions:
 1. **Flat Key/Value Storage:** Attributes are validated at ingestion to guarantee a flat dictionary of strings, numbers, or booleans.
 2. **Fast Streaming Serialization:** Ingested JSON objects are converted directly into escaped CSV string representations in memory and streamed straight into PostgreSQL's `COPY` interface, avoiding intermediate ORM model allocations.
-3. **String-Equivalence Querying:** Query filters like `attr.user_id=42` utilize PostgreSQL's `attributes->>'user_id' = $1` operator. Because `->>` extracts JSON values directly as text, numeric (`42`), string (`"42"`), and boolean (`true`) values are compared as strings with zero schema migration requirements for new attribute keys.
+3. **String-Equivalence Querying & Strict Parameterization:** Query filters like `attr.user_id=42` utilize PostgreSQL's `attributes->>$1 = $2` parameterized operator. Keys and values are bound as positional query parameters ($1 for key, $2 for value), guaranteeing SQL injection immunity without query string interpolation. Because `->>` extracts JSON values directly as text, numeric (`42`), string (`"42"`), and boolean (`true`) values are compared as strings with zero schema migration requirements for new attribute keys.
 
 ---
 

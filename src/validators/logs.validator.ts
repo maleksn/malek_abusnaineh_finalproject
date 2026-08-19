@@ -3,9 +3,16 @@ import { z } from "zod";
 // for POST /logs request validation
 const MAX_FUTURE_OFFSET_MS = 300000; // 5 minutes in milliseconds
 
-const attributeValueSchema = z.union([z.string(), z.number(), z.boolean()]);
+const attributeValueSchema = z.union([
+  z.string().refine((val) => !val.includes("\0"), "attribute value must not contain null bytes"),
+  z.number(),
+  z.boolean(),
+]);
 
-const attributesSchema = z.record(z.string(), attributeValueSchema);
+const attributesSchema = z.record(
+  z.string().refine((key) => !key.includes("\0"), "attribute key must not contain null bytes"),
+  attributeValueSchema,
+);
 
 export const logSchema = z.object({
   timestamp: z.iso.datetime().refine(
@@ -23,9 +30,9 @@ export const logSchema = z.object({
 
   level: z.enum(["debug", "info", "warn", "error"]),
 
-  service: z.string().trim().min(1),
+  service: z.string().trim().min(1).refine((s) => !s.includes("\0"), "service must not contain null bytes"),
 
-  message: z.string().trim().min(1),
+  message: z.string().trim().min(1).refine((m) => !m.includes("\0"), "message must not contain null bytes"),
 
   attributes: attributesSchema.default({}),
 });

@@ -10,7 +10,14 @@ types.setTypeParser(20, (val: string) => Number(val));
 types.setTypeParser(1184, (val: string) => {
   if (!val) return val;
   // Convert Postgres timestamptz text (e.g. '2026-08-18 19:40:00.123+00') to ISO-8601
-  return val.indexOf("T") === -1 ? val.replace(" ", "T").replace(/\+00$/, "Z") : val;
+  let s = val.indexOf("T") === -1 ? val.replace(" ", "T") : val;
+  if (s.endsWith("+00") || s.endsWith("+00:00")) {
+    return s.replace(/\+00(:00)?$/, "Z");
+  }
+  if (/[+-]\d{2}$/.test(s)) {
+    return s + ":00";
+  }
+  return s;
 });
 // OID 1114: timestamp without timezone
 types.setTypeParser(1114, (val: string) => {
@@ -54,7 +61,15 @@ export async function checkDatabaseConnection(): Promise<void> {
 }
 
 export async function runMigrations(): Promise<void> {
-  await migrate(db, {
-    migrationsFolder: "./drizzle",
-  });
+  try {
+    await migrate(db, {
+      migrationsFolder: "./drizzle",
+    });
+  } catch (err: unknown) {
+    const error = err as { cause?: { code?: string } };
+    if (error?.cause?.code === "42710") {
+      return;
+    }
+    throw err;
+  }
 }

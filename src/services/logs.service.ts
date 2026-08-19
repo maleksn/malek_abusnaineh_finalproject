@@ -214,9 +214,8 @@ export async function queryLogs(
 
   const attrEntries = Object.entries(attributeFilters);
   for (const [key, value] of attrEntries) {
-    const safeKey = key.replace(/'/g, "''");
-    params.push(value);
-    whereClauses.push(`attributes->>'${safeKey}' = $${params.length}`);
+    params.push(key, value);
+    whereClauses.push(`attributes->>$${params.length - 1} = $${params.length}`);
   }
 
   params.push(query.limit + 1);
@@ -369,9 +368,8 @@ export async function aggregateLogs(
   }
 
   for (const [key, value] of Object.entries(attributeFilters)) {
-    const safeKey = key.replace(/'/g, "''");
-    params.push(value);
-    whereClauses.push(`attributes->>'${safeKey}' = $${params.length}`);
+    params.push(key, value);
+    whereClauses.push(`attributes->>$${params.length - 1} = $${params.length}`);
   }
 
   const groupCol =
