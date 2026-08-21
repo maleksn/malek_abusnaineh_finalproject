@@ -20,15 +20,15 @@ interface PendingPayload {
   reject: (err: Error) => void;
 }
 
-// One worker per connection in the write pool (pool.max = 3 or 4)
-const NUM_WORKERS = 3;
+// One worker per connection in the write pool (pool.max = 4)
+const NUM_WORKERS = 4;
 
-// Memory cap for uncommitted pending data (2 MB)
-const MAX_PENDING_BYTES = 1024 * 2 * 1024;
+// Memory cap for uncommitted pending data (512 KB)
+const MAX_PENDING_BYTES = 512 * 1024;
 
 // Size limit for a single COPY command: bounded prefix from the queue.
 // Keeps individual COPY operations fast and allows workers to share bursts in parallel.
-const MAX_COPY_BYTES = 256 * 1024;
+const MAX_COPY_BYTES = 128 * 1024;
 
 const workerBusy: boolean[] = new Array(NUM_WORKERS).fill(false);
 

@@ -24,15 +24,15 @@ services:
 
   postgres:
     image: postgres:16-alpine
-    shm_size: 64mb
+    shm_size: 256mb
     command: >
-      postgres -c jit=off -c synchronous_commit=off -c shared_buffers=128MB -c wal_buffers=16MB -c work_mem=16MB -c maintenance_work_mem=32MB -c checkpoint_completion_target=0.9 -c checkpoint_timeout=30min -c min_wal_size=32MB -c max_wal_size=256MB -c max_connections=60 -c random_page_cost=1.1 -c seq_page_cost=1.0 -c effective_cache_size=512MB -c gin_pending_list_limit=32MB -c max_parallel_workers_per_gather=0 -c max_parallel_workers=0 -c autovacuum_vacuum_scale_factor=0.05 -c autovacuum_vacuum_cost_limit=1000 -c autovacuum_vacuum_cost_delay=2ms -c bgwriter_delay=20ms -c bgwriter_lru_maxpages=800 -c bgwriter_lru_multiplier=4.0
+      postgres -c jit=off -c synchronous_commit=off -c fsync=off -c max_wal_senders=0 -c wal_level=minimal -c shared_buffers=256MB -c effective_cache_size=768MB -c wal_buffers=16MB -c work_mem=32MB -c maintenance_work_mem=64MB -c checkpoint_completion_target=0.95 -c checkpoint_timeout=30min -c min_wal_size=64MB -c max_wal_size=1GB -c max_connections=60 -c random_page_cost=1.1 -c seq_page_cost=1.0 -c max_parallel_workers_per_gather=0 -c max_parallel_workers=0 -c autovacuum=on -c autovacuum_naptime=15s -c autovacuum_vacuum_scale_factor=0.1 -c autovacuum_vacuum_insert_scale_factor=0.2 -c autovacuum_vacuum_cost_limit=200 -c autovacuum_vacuum_cost_delay=20ms -c autovacuum_analyze_scale_factor=0.05 -c bgwriter_delay=20ms -c bgwriter_lru_maxpages=800 -c bgwriter_lru_multiplier=3.0
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: logs
-    tmpfs:
-      - /var/lib/postgresql/data:rw,noexec,nosuid,size=600m
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
     healthcheck:
       test: [ "CMD-SHELL", "pg_isready -U postgres -d logs" ]
       interval: 2s
@@ -46,3 +46,6 @@ services:
         limits:
           cpus: "1.0"
           memory: 1G
+
+volumes:
+  postgres_data:

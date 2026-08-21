@@ -49,7 +49,7 @@ export const readPool = new Pool({
   connectionString: process.env.DATABASE_URL!,
   max: 4,
   idleTimeoutMillis: 30000,
-  statement_timeout: 3000,
+  statement_timeout: 5000,
 });
 
 readPool.on("error", (err) => {

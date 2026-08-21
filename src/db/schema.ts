@@ -57,10 +57,9 @@ export const logs = pgTable(
       .defaultNow(),
   },
   (table) => [
-    // DATABASE INDEX 1: Allows super-fast search and sorting by time, service, and level
-    index("logs_timestamp_id_service_level_idx").on(
+    // DATABASE INDEX 1: Composite Covering Index for Aggregations, Time-Range Filters & Grouping
+    index("logs_timestamp_service_level_idx").on(
       table.timestamp.asc(),
-      table.id.asc(),
       table.service,
       table.level,
     ),

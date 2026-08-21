@@ -1,5 +1,5 @@
 {
-  "id": "7dde1f40-23b3-4aff-ba2c-237d146e91f5",
+  "id": "06a22797-5ad6-4982-a115-146e7941198d",
   "prevId": "00000000-0000-0000-0000-000000000000",
   "version": "7",
   "dialect": "postgresql",
@@ -55,17 +55,11 @@
         }
       },
       "indexes": {
-        "logs_timestamp_id_service_level_idx": {
-          "name": "logs_timestamp_id_service_level_idx",
+        "logs_timestamp_service_level_idx": {
+          "name": "logs_timestamp_service_level_idx",
           "columns": [
             {
               "expression": "timestamp",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            },
-            {
-              "expression": "id",
               "isExpression": false,
               "asc": true,
               "nulls": "last"
