@@ -404,15 +404,22 @@ Testing was conducted using the automated load benchmark tool in Docker matching
    - *Discovery:* An early composite index `(timestamp ASC, id ASC, service, level)` caused `GET /logs/aggregate` p95 latency to spike to **5,754 ms** under sustained write load (Queries score: 3.0/15, consistency 2/4). Because `id` is a strictly unique `bigserial` integer placed ahead of `service` and `level`, every index tuple had a unique second key. PostgreSQL could not leverage index ordering for `GROUP BY service` or `GROUP BY level`, and index leaf pages suffered severe memory bloat.
    - *Optimization:* Refined the index to `(timestamp ASC, service, level)`. Removing `id` reduced index leaf size by ~40%, allowed true contiguous B-Tree leaf range scans for `date_bin()` groupings, and achieved zero heap lookups. Aggregation p95 latency dropped from **5,754 ms to 210 ms** (a **27.4x improvement**), boosting Queries score to **11.2/15** and consistency to **4/4**.
 
-### Benchmark Run Progression History
+### Comprehensive Benchmark Progression & Architecture Evolution
 
-| Run Milestone | Environment / CPUs | Index Configuration | Throughput | Ingest p95 | Aggregation p95 | Queries Score | Total Score |
+The service underwent systematic iterative optimizations, moving from an early naive architecture to a high-throughput, memory-bounded, zero-data-loss streaming engine. Below is the empirical progression across all milestones:
+
+| Milestone / Commit | Architecture & Changes | Ingestion Rate | Error Rate | Ingest p95 | Aggregation p95 | Consistency | Overall Score |
 |---|---|---|---|---|---|---|---|
-| **Run 1 (Baseline with ID)** | 10 CPUs (WSL), 6 GiB | `(timestamp, id, service, level)` | 14,983/s | 87 ms | **5,754 ms** | 3.0 / 15 | **83.0 / 100** |
-| **Run 2 (Index Fixed, CPU Contention)** | 6 CPUs (WSL), 6 GiB | `(timestamp, service, level)` | 14,530/s | 457 ms | **2,152 ms** | 4.5 / 15 | **79.9 / 100** |
-| **Run 3 (Final Optimized Stack)** | 10 CPUs (WSL), 6 GiB | `(timestamp, service, level)` | **14,999/s** | **6 ms** | **210 ms** | **11.2 / 15** | **91.2 / 100** |
+| **1. Naive Baseline (`b42354b`)** | GIN indexes + Single-worker batch insert | 7,973/s | 46.7% | 279 ms | 8,464 ms | 4/4 | **59.6 / 100** |
+| **2. Date-Bin & Raw SQL (`f05f547`)** | Removed GIN, introduced `date_bin` & raw SQL | 11,064/s | 0.0% | 1,453 ms | 6,940 ms | 2/4 | **67.8 / 100** |
+| **3. Read Isolation & Fast Ack (`8bba310`)** | Added `readPool` + OID parsers *(Ack before DB commit)* | 14,999/s | 0.0% | 1 ms | 2 ms | **0/4 (Violated)** | **91.5 / 100** *(Invalid)* |
+| **4. Strict Sync Durability (`7567760`)** | Enforced commit wait *(Unpaced backpressure lockup)* | 0/s | **100.0%** | 34 ms | 11 ms | 4/4 | **59.8 / 100** |
+| **5. Group-Commit with ID Index (`2ec2b4f`)** | Paced admission queue + `(timestamp, id, srv, lvl)` | 14,983/s | 0.0% | 87 ms | **5,754 ms** | 2/4 | **83.0 / 100** |
+| **6. Final Production Stack (`main`)** | True covering index `(timestamp, srv, lvl)` + 10 CPUs | **14,999/s** | **0.0%** | **6 ms** | **210 ms** | **4/4** | **91.2 / 100** 🏆 |
 
-*Note: In Run 2, the Docker engine was allocated 6 CPUs while the benchmark required 7.5 CPUs (6 generator + 1 postgres + 0.5 app), causing severe CPU contention. Increasing WSL processors to 10 in `.wslconfig` (Run 3) resolved generator contention and revealed the full speedup of the new covering index.*
+#### Key Engineering Insights from Evolution:
+1. **The Ingestion Consistency vs Latency Tradeoff (Milestones 3 & 4):** Milestones 3 and 4 demonstrated why returning HTTP 200 before disk persistence is unacceptable (Milestone 3 failed consistency at 0/4), while uncoordinated synchronous waiting creates catastrophic lockups (Milestone 4 hit 100% rejection). The ultimate fix was the **Paced Admission Group-Commit Queue**, where incoming requests are batched, committed via `COPY`, and admitted strictly at PostgreSQL's durable write rate.
+2. **Covering Index Optimization (Milestones 5 & 6):** Removing `id` from the composite index reduced B-Tree leaf node bloat by ~40% and enabled true contiguous leaf scans for time-bucketed groupings, dropping aggregation p95 latency from **5,754 ms to 210 ms** (a **27.4x acceleration**).
 
 ---
 
